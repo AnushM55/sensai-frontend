@@ -4,7 +4,13 @@ import { useCallback, useMemo, useState, useEffect } from "react";
 import BlockNoteEditor from "./BlockNoteEditor";
 import ChatView from "./ChatView";
 import ScorecardView from "./ScorecardView";
-import { ChatMessage, ScorecardItem } from "../types/quiz";
+import {
+    ChatMessage,
+    ScorecardItem,
+    FeedbackOutput,
+    FeedbackAttemptSummary,
+    FeedbackCriterionDiff,
+} from "../types/quiz";
 import { getDraft, setDraft, deleteDraft } from '@/lib/utils/indexedDB';
 import { blobToBase64, convertAudioBufferToWav } from '@/lib/utils/audioUtils';
 import Toast from "./Toast";
@@ -45,17 +51,26 @@ interface ChatMessageLocal {
     timestamp: Date;
     messageType?: MessageType;
     audioData?: string;
+    scorecard?: ScorecardItem[];
     isError?: boolean;
     rawContent?: string; // Store the original JSON content for AI messages
+    feedbackOutput?: FeedbackOutput;
+    attemptId?: number;
+    diffFromPrevious?: FeedbackCriterionDiff[];
+    fileUuid?: string;
+    fileName?: string;
 }
 
 // New assignment response interface
 interface AssignmentResponse {
     feedback: string;
     evaluation_status: "in_progress" | "needs_resubmission" | "completed";
-    key_area_scores: Record<string, number>;
+    key_area_scores: Record<string, any>;
     current_key_area: string;
     project_score?: number;
+    feedback_output?: FeedbackOutput;
+    attempt_id?: number;
+    diff_from_previous?: FeedbackCriterionDiff[];
 }
 
 export default function LearnerAssignmentView({
@@ -96,6 +111,9 @@ export default function LearnerAssignmentView({
     // Scorecard state
     const [isViewingScorecard, setIsViewingScorecard] = useState(false);
     const [activeScorecard, setActiveScorecard] = useState<ScorecardItem[]>([]);
+    const [activeAttemptId, setActiveAttemptId] = useState<number | undefined>(undefined);
+    const [feedbackAttempts, setFeedbackAttempts] = useState<FeedbackAttemptSummary[]>([]);
+    const [isReevaluating, setIsReevaluating] = useState(false);
     const [showPreparingReport, setShowPreparingReport] = useState(false);
 
     // Input state for ChatView
@@ -191,16 +209,95 @@ export default function LearnerAssignmentView({
     }, [onTaskComplete, taskId]);
 
 
+    const convertFeedbackCriteriaToScorecard = useCallback((criteria: any[]): ScorecardItem[] => {
+        if (!Array.isArray(criteria)) {
+            return [];
+        }
+
+        return criteria.map((criterion: any) => ({
+            category: criterion.criterion_name || 'Criterion',
+            score: Number(criterion?.score || 0),
+            max_score: Number(criterion?.max_score || 0),
+            pass_score: Number(criterion?.pass_score || 0),
+            feedback: {
+                correct: '',
+                wrong: criterion?.next_step || '',
+            },
+            evidence: Array.isArray(criterion?.evidence) ? criterion.evidence : [],
+            next_step: criterion?.next_step || '',
+            severity: criterion?.severity,
+        }));
+    }, []);
+
+    const mergeFeedbackOutputIntoScorecard = useCallback((
+        scorecard: ScorecardItem[],
+        feedbackOutput?: FeedbackOutput,
+    ): ScorecardItem[] => {
+        if (!feedbackOutput?.criteria || feedbackOutput.criteria.length === 0) {
+            return scorecard;
+        }
+
+        const byName = new Map(
+            feedbackOutput.criteria.map((criterion) => [criterion.criterion_name, criterion])
+        );
+
+        return scorecard.map((item) => {
+            const criterion = byName.get(item.category);
+            if (!criterion) {
+                return item;
+            }
+
+            return {
+                ...item,
+                evidence: criterion.evidence,
+                next_step: criterion.next_step,
+                severity: criterion.severity,
+            };
+        });
+    }, []);
+
     // Helper function to convert scorecard scores to ScorecardItem format
-    const convertScorecardScoresToScorecard = useCallback((scorecardScores: Record<string, any>): ScorecardItem[] => {
-        return Object.entries(scorecardScores).map(([category, data]) => ({
+    const convertScorecardScoresToScorecard = useCallback((
+        scorecardScores: Record<string, any>,
+        feedbackOutput?: FeedbackOutput,
+    ): ScorecardItem[] => {
+        const scorecard = Object.entries(scorecardScores || {}).map(([category, data]) => ({
             category,
             score: data.score || 0,
             max_score: data.max_score || 4,
             pass_score: data.pass_score || 3,
             feedback: data.feedback || {}
-        }));
-    }, []);
+        })) as ScorecardItem[];
+
+        return mergeFeedbackOutputIntoScorecard(scorecard, feedbackOutput);
+    }, [mergeFeedbackOutputIntoScorecard]);
+
+    const fetchFeedbackAttempts = useCallback(async () => {
+        if (isTestMode || !userId || !taskId) {
+            return;
+        }
+
+        try {
+            const params = new URLSearchParams({
+                user_id: String(userId),
+                task_id: String(taskId),
+                limit: '20',
+            });
+
+            const response = await fetch(
+                `${process.env.NEXT_PUBLIC_BACKEND_URL}/ai/feedback/attempts?${params.toString()}`
+            );
+
+            if (!response.ok) {
+                throw new Error('Failed to fetch feedback attempts');
+            }
+
+            const attempts = await response.json();
+            setFeedbackAttempts(Array.isArray(attempts) ? attempts : []);
+        } catch (error) {
+            console.error('Error fetching feedback attempts:', error);
+        }
+    }, [isTestMode, userId, taskId]);
 
     // Function to store chat history in backend
     const storeChatHistory = useCallback(async (userMessage: ChatMessageLocal, aiResponse: AssignmentResponse) => {
@@ -212,6 +309,9 @@ export default function LearnerAssignmentView({
             evaluation_status: aiResponse.evaluation_status,
             current_key_area: aiResponse.current_key_area,
             key_area_scores: aiResponse.key_area_scores,
+            ...(aiResponse.feedback_output ? { feedback_output: aiResponse.feedback_output } : {}),
+            ...(aiResponse.attempt_id !== undefined ? { attempt_id: aiResponse.attempt_id } : {}),
+            ...(aiResponse.diff_from_previous ? { diff_from_previous: aiResponse.diff_from_previous } : {}),
             ...(aiResponse.project_score !== undefined && { project_score: aiResponse.project_score }),
         };
         const aiContent = JSON.stringify(contentObj);
@@ -323,12 +423,28 @@ export default function LearnerAssignmentView({
                     // For user file messages, extract filename from JSON content
                     let displayContent = message.content;
                     let rawContent = message.content;
+                    let feedbackOutput: FeedbackOutput | undefined;
+                    let attemptId: number | undefined;
+                    let diffFromPrevious: FeedbackCriterionDiff[] | undefined;
+
                     if (message.role === 'assistant' && message.content) {
                         try {
                             const parsedContent = JSON.parse(message.content);
                             if (parsedContent.feedback) {
                                 displayContent = parsedContent.feedback;
                                 rawContent = message.content;
+                            }
+
+                            if (parsedContent.feedback_output) {
+                                feedbackOutput = parsedContent.feedback_output;
+                            }
+
+                            if (parsedContent.attempt_id !== undefined) {
+                                attemptId = parsedContent.attempt_id;
+                            }
+
+                            if (Array.isArray(parsedContent.diff_from_previous)) {
+                                diffFromPrevious = parsedContent.diff_from_previous;
                             }
                         } catch (error) {
                             // If parsing fails, use the original content
@@ -369,6 +485,9 @@ export default function LearnerAssignmentView({
                         audioData: audioData,
                         isError: false,
                         rawContent: rawContent,
+                        feedbackOutput,
+                        attemptId,
+                        diffFromPrevious,
                         fileUuid: fileUuid,
                         fileName: fileName
                     };
@@ -377,6 +496,8 @@ export default function LearnerAssignmentView({
                 setChatHistory(localChatHistory);
                 setIsChatHistoryLoaded(true);
 
+                fetchFeedbackAttempts();
+
             } catch (error) {
                 console.error("Error fetching chat history:", error);
                 setIsChatHistoryLoaded(true); // Set to true even on error to prevent retries
@@ -384,7 +505,7 @@ export default function LearnerAssignmentView({
         };
 
         fetchChatHistory();
-    }, [isTestMode, userId, isChatHistoryLoaded, taskId]);
+    }, [isTestMode, userId, isChatHistoryLoaded, taskId, fetchFeedbackAttempts]);
 
     // Derived config for ChatView
     const currentQuestionConfig = useMemo(() => ({
@@ -408,8 +529,31 @@ export default function LearnerAssignmentView({
             if (base.sender === 'ai') {
                 try {
                     const parsed = JSON.parse(base.rawContent || base.content || '{}');
-                    if (parsed && parsed.evaluation_status === 'completed' && parsed.key_area_scores) {
-                        const scorecard = convertScorecardScoresToScorecard(parsed.key_area_scores);
+
+                    if (parsed.feedback_output) {
+                        base.feedbackOutput = parsed.feedback_output;
+                    }
+
+                    if (parsed.attempt_id !== undefined) {
+                        base.attemptId = parsed.attempt_id;
+                    }
+
+                    if (Array.isArray(parsed.diff_from_previous)) {
+                        base.diffFromPrevious = parsed.diff_from_previous;
+                    }
+
+                    if (parsed && parsed.evaluation_status === 'completed') {
+                        let scorecard: ScorecardItem[] = [];
+
+                        if (parsed.feedback_output?.criteria) {
+                            scorecard = convertFeedbackCriteriaToScorecard(parsed.feedback_output.criteria);
+                        } else if (parsed.key_area_scores) {
+                            scorecard = convertScorecardScoresToScorecard(
+                                parsed.key_area_scores,
+                                parsed.feedback_output,
+                            );
+                        }
+
                         if (Array.isArray(scorecard) && scorecard.length > 0) {
                             base.scorecard = scorecard;
                             // Ensure displayed content is feedback text
@@ -423,7 +567,7 @@ export default function LearnerAssignmentView({
             return base;
         });
         return mapped as unknown as ChatMessage[];
-    }, [chatHistory, convertScorecardScoresToScorecard]);
+    }, [chatHistory, convertFeedbackCriteriaToScorecard, convertScorecardScoresToScorecard]);
 
     // Helpers for ChatView handlers
     const handleInputChange = useCallback((e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
@@ -795,6 +939,10 @@ export default function LearnerAssignmentView({
                             if (!isTestMode) {
                                 storeChatHistory(storageMessage, assignmentResponse);
                             }
+
+                            if (assignmentResponse.attempt_id !== undefined) {
+                                fetchFeedbackAttempts();
+                            }
                         } catch (error) {
                             const err = error as Error;
                             console.error('assignment stream: processing error', { message: err?.message, stack: err?.stack });
@@ -853,7 +1001,8 @@ export default function LearnerAssignmentView({
             storeChatHistory,
             handleAssignmentResponse,
             showPreparingReport,
-            chatHistory
+            chatHistory,
+            fetchFeedbackAttempts
         ]
     );
 
@@ -925,16 +1074,165 @@ export default function LearnerAssignmentView({
         }
     };
 
-    const handleViewScorecard = useCallback((scorecard: ScorecardItem[]) => {
-        setActiveScorecard(scorecard);
+    const handleViewScorecard = useCallback((
+        scorecard: ScorecardItem[],
+        message?: ChatMessage,
+        explicitAttemptId?: number,
+        feedbackOutput?: FeedbackOutput,
+    ) => {
+        setActiveScorecard(
+            mergeFeedbackOutputIntoScorecard(
+                scorecard,
+                feedbackOutput || message?.feedbackOutput,
+            )
+        );
+        setActiveAttemptId(
+            explicitAttemptId
+            ?? message?.attemptId
+            ?? feedbackOutput?.attempt_id
+            ?? message?.feedbackOutput?.attempt_id
+        );
         setIsViewingScorecard(true);
         // Hide preparing report once the scorecard is opened
         setShowPreparingReport(false);
-    }, []);
+    }, [mergeFeedbackOutputIntoScorecard]);
 
     const handleBackToChat = useCallback(() => {
         setIsViewingScorecard(false);
     }, []);
+
+    const handleReevaluate = useCallback(async () => {
+        if (!taskId || !userId) {
+            return;
+        }
+
+        const latestUserMessage = [...chatHistory].reverse().find((message) => message.sender === 'user');
+
+        if (!latestUserMessage) {
+            setToastData({
+                title: 'No submission found',
+                description: 'Submit your assignment before re-evaluating.',
+                emoji: '⚠️',
+            });
+            setShowToast(true);
+            return;
+        }
+
+        setIsReevaluating(true);
+
+        try {
+            const latestSubmission = latestUserMessage.rawContent || latestUserMessage.content;
+
+            const response = await fetch(`${process.env.NEXT_PUBLIC_BACKEND_URL}/ai/feedback/re-evaluate`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    user_id: Number(userId),
+                    user_email: user?.email,
+                    task_id: Number(taskId),
+                    task_type: 'assignment',
+                    latest_submission: latestSubmission,
+                }),
+            });
+
+            if (!response.ok) {
+                throw new Error(`Failed to re-evaluate assignment: ${response.status}`);
+            }
+
+            const payload = await response.json();
+            const feedbackOutput: FeedbackOutput = {
+                feedback_summary: payload.feedback_summary,
+                criteria: payload.criteria || [],
+                overall_score: payload.overall_score,
+                attempt_id: payload.attempt_id,
+            };
+
+            let scorecard: ScorecardItem[] = [];
+            if (payload.scorecard) {
+                scorecard = convertScorecardScoresToScorecard(payload.scorecard, feedbackOutput);
+            } else if (feedbackOutput.criteria) {
+                scorecard = convertFeedbackCriteriaToScorecard(feedbackOutput.criteria);
+            }
+
+            const aiMessage: ChatMessageLocal = {
+                id: `ai-reevaluate-${Date.now()}`,
+                content: payload.feedback || payload.feedback_summary || 'Feedback updated.',
+                sender: 'ai',
+                timestamp: new Date(),
+                messageType: 'text',
+                scorecard,
+                feedbackOutput,
+                attemptId: payload.attempt_id,
+                diffFromPrevious: payload.diff_from_previous,
+                rawContent: JSON.stringify({
+                    feedback: payload.feedback || payload.feedback_summary || 'Feedback updated.',
+                    evaluation_status: 'completed',
+                    key_area_scores: payload.scorecard || {},
+                    feedback_output: feedbackOutput,
+                    attempt_id: payload.attempt_id,
+                    diff_from_previous: payload.diff_from_previous,
+                }),
+            };
+
+            setChatHistory((prev) => [...prev, aiMessage]);
+            handleViewScorecard(scorecard, aiMessage as unknown as ChatMessage, payload.attempt_id, feedbackOutput);
+
+            fetchFeedbackAttempts();
+
+            if (!isTestMode) {
+                const assistantPayload = JSON.stringify({
+                    feedback: aiMessage.content,
+                    evaluation_status: 'completed',
+                    key_area_scores: payload.scorecard || {},
+                    feedback_output: feedbackOutput,
+                    attempt_id: payload.attempt_id,
+                    diff_from_previous: payload.diff_from_previous,
+                });
+
+                await fetch(`${process.env.NEXT_PUBLIC_BACKEND_URL}/chat/?userId=${encodeURIComponent(userId)}&taskId=${encodeURIComponent(taskId)}`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        user_id: Number(userId),
+                        task_id: Number(taskId),
+                        messages: [
+                            {
+                                role: 'assistant',
+                                content: assistantPayload,
+                                response_type: null,
+                                created_at: new Date(),
+                            },
+                        ],
+                        is_complete: true,
+                    }),
+                });
+            }
+        } catch (error) {
+            console.error('Error re-evaluating assignment:', error);
+            setToastData({
+                title: 'Re-evaluation failed',
+                description: 'Please try again in a moment.',
+                emoji: '⚠️',
+            });
+            setShowToast(true);
+        } finally {
+            setIsReevaluating(false);
+        }
+    }, [
+        taskId,
+        userId,
+        user?.email,
+        chatHistory,
+        convertScorecardScoresToScorecard,
+        convertFeedbackCriteriaToScorecard,
+        handleViewScorecard,
+        fetchFeedbackAttempts,
+        isTestMode,
+    ]);
 
     const handleFileDownload = useCallback(async (fileUuid: string, fileName: string) => {
         try {
@@ -994,8 +1292,18 @@ export default function LearnerAssignmentView({
         try {
             const parsedContent = JSON.parse(lastAiMessage.rawContent || lastAiMessage.content);
             // check if all criteria are met
-            if (parsedContent.key_area_scores && parsedContent.evaluation_status === "completed") {
-                const scorecard = convertScorecardScoresToScorecard(parsedContent.key_area_scores);
+            if (parsedContent.evaluation_status === "completed") {
+                let scorecard: ScorecardItem[] = [];
+
+                if (parsedContent.feedback_output?.criteria) {
+                    scorecard = convertFeedbackCriteriaToScorecard(parsedContent.feedback_output.criteria);
+                } else if (parsedContent.key_area_scores) {
+                    scorecard = convertScorecardScoresToScorecard(
+                        parsedContent.key_area_scores,
+                        parsedContent.feedback_output,
+                    );
+                }
+
                 if (scorecard.length > 0) {
                     // check if all scorecard items meet their pass criteria
                     const allCriteriaMet = scorecard.every((item: ScorecardItem) =>
@@ -1015,7 +1323,7 @@ export default function LearnerAssignmentView({
             const content = lastAiMessage.rawContent || lastAiMessage.content;
             return content ? content.includes('"evaluation_status":"completed"') : false;
         }
-    }, [evaluationStatus, chatHistory, convertScorecardScoresToScorecard]);
+    }, [evaluationStatus, chatHistory, convertFeedbackCriteriaToScorecard, convertScorecardScoresToScorecard]);
 
     // Load draft on task change
     useEffect(() => {
@@ -1041,21 +1349,35 @@ export default function LearnerAssignmentView({
             if (lastAiMessage) {
                 try {
                     const parsedContent = JSON.parse(lastAiMessage.rawContent || lastAiMessage.content);
-                    if (parsedContent.key_area_scores) {
-                        const scorecard = convertScorecardScoresToScorecard(parsedContent.key_area_scores);
-                        if (scorecard.length > 0) {
-                            setActiveScorecard(scorecard);
-                            setIsViewingScorecard(true);
-                            // Ensure the preparing report banner is hidden when opening scorecard automatically
-                            setShowPreparingReport(false);
-                        }
+                    let scorecard: ScorecardItem[] = [];
+
+                    if (parsedContent.feedback_output?.criteria) {
+                        scorecard = convertFeedbackCriteriaToScorecard(parsedContent.feedback_output.criteria);
+                    } else if (parsedContent.key_area_scores) {
+                        scorecard = convertScorecardScoresToScorecard(
+                            parsedContent.key_area_scores,
+                            parsedContent.feedback_output,
+                        );
+                    }
+
+                    if (scorecard.length > 0) {
+                        setActiveScorecard(scorecard);
+                        setActiveAttemptId(parsedContent.attempt_id);
+                        setIsViewingScorecard(true);
+                        // Ensure the preparing report banner is hidden when opening scorecard automatically
+                        setShowPreparingReport(false);
                     }
                 } catch (error) {
                     console.log('Failed to parse AI message for scorecard:', error);
                 }
             }
         }
-    }, [isCompleted, chatHistory, convertScorecardScoresToScorecard]);
+    }, [
+        isCompleted,
+        chatHistory,
+        convertFeedbackCriteriaToScorecard,
+        convertScorecardScoresToScorecard,
+    ]);
 
     // Check if needs resubmission based on evaluation status or last AI message
     const needsResubmission = useMemo(() => {
@@ -1204,6 +1526,10 @@ export default function LearnerAssignmentView({
                             activeScorecard={activeScorecard}
                             handleBackToChat={handleBackToChat}
                             lastUserMessage={null}
+                            feedbackAttempts={feedbackAttempts}
+                            activeAttemptId={activeAttemptId}
+                            onReevaluate={handleReevaluate}
+                            isReevaluating={isReevaluating}
                         />
                     ) : (
                         /* Use the ChatView component */

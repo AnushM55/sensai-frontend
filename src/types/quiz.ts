@@ -109,6 +109,44 @@ export interface APIQuestionResponse {
     settings?: any;
 }
 
+export interface FeedbackEvidence {
+    type: 'code_line' | 'test_case' | 'quote' | 'reasoning_gap';
+    reference: string;
+    description: string;
+}
+
+export interface CriterionFeedbackItem {
+    criterion_name: string;
+    score: number;
+    max_score: number;
+    pass_score: number;
+    evidence: FeedbackEvidence[];
+    next_step: string;
+    severity: 'low' | 'medium' | 'high';
+}
+
+export interface FeedbackOutput {
+    feedback_summary: string;
+    criteria: CriterionFeedbackItem[];
+    overall_score: number;
+    attempt_id?: number;
+    surfaced_criteria?: CriterionFeedbackItem[];
+}
+
+export interface FeedbackCriterionDiff {
+    criterion_name: string;
+    previous_score?: number;
+    current_score: number;
+    change: 'improved' | 'regressed' | 'unchanged' | 'new';
+}
+
+export interface FeedbackAttemptSummary {
+    attempt_id: number;
+    overall_score: number;
+    feedback_summary: string;
+    created_at: string;
+}
+
 
 // Define a message type for the chat history
 export interface ChatMessage {
@@ -119,6 +157,9 @@ export interface ChatMessage {
     messageType?: 'text' | 'audio' | 'code' | 'file';
     audioData?: string; // base64 encoded audio data
     scorecard?: ScorecardItem[]; // Add scorecard field for detailed feedback
+    feedbackOutput?: FeedbackOutput;
+    attemptId?: number;
+    diffFromPrevious?: FeedbackCriterionDiff[];
     isError?: boolean;
     is_correct?: boolean; // Add is_correct attribute for exam responses
     fileUuid?: string; // UUID for file messages
@@ -135,11 +176,17 @@ export interface ScorecardItem {
     };
     score: number;
     max_score: number;
-    pass_score: number
+    pass_score: number;
+    evidence?: FeedbackEvidence[];
+    next_step?: string;
+    severity?: 'low' | 'medium' | 'high';
 }
 
 export interface AIResponse {
     feedback: string;
     is_correct: boolean;
     scorecard?: ScorecardItem[];
+    feedback_output?: FeedbackOutput;
+    attempt_id?: number;
+    diff_from_previous?: FeedbackCriterionDiff[];
 }

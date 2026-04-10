@@ -4,7 +4,17 @@ import "@blocknote/core/fonts/inter.css";
 import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import { ChevronLeft, ChevronRight, MoreVertical, Maximize2, Minimize2, MessageCircle, X, Columns, LayoutGrid, SplitSquareVertical, CheckCircle, Eye, EyeOff } from "lucide-react";
 import BlockNoteEditor from "./BlockNoteEditor";
-import { QuizQuestion, ChatMessage, ScorecardItem, AIResponse, QuizQuestionConfig } from "../types/quiz";
+import {
+    QuizQuestion,
+    ChatMessage,
+    ScorecardItem,
+    AIResponse,
+    QuizQuestionConfig,
+    FeedbackOutput,
+    FeedbackCriterionDiff,
+    FeedbackAttemptSummary,
+    FeedbackEvidence,
+} from "../types/quiz";
 import ChatView, { CodeViewState, ChatViewHandle } from './ChatView';
 import ScorecardView from './ScorecardView';
 import ConfirmationDialog from './ConfirmationDialog';
@@ -43,6 +53,135 @@ export interface LearnerQuizViewProps {
     onMobileViewChange?: (mode: MobileViewMode) => void;
     isAdminView?: boolean;
 }
+
+interface CodeTestCase {
+    id: string;
+    stdin?: string;
+    expected_output?: string;
+}
+
+const JUDGE0_LANGUAGE_IDS: Record<string, number> = {
+    python: 71,
+    sql: 82,
+    javascript: 63,
+    nodejs: 63,
+};
+
+const LANGUAGE_ALIASES: Record<string, string> = {
+    js: 'javascript',
+    node: 'nodejs',
+    'node.js': 'nodejs',
+    'node-js': 'nodejs',
+    py: 'python',
+};
+
+const normaliseCodeLanguage = (value?: string) => {
+    if (!value) {
+        return '';
+    }
+
+    const cleaned = value.trim().toLowerCase();
+    return LANGUAGE_ALIASES[cleaned] || cleaned;
+};
+
+const extractCodeTestCasesFromSettings = (settings: any): CodeTestCase[] => {
+    const rawCases =
+        settings?.code_test_cases
+        ?? settings?.codeTestCases
+        ?? settings?.test_cases
+        ?? settings?.testCases
+        ?? [];
+
+    if (!Array.isArray(rawCases)) {
+        return [];
+    }
+
+    return rawCases
+        .map((testCase: any, index: number) => ({
+            id: String(
+                testCase?.id
+                ?? testCase?.name
+                ?? testCase?.test_case_id
+                ?? `tc-${index + 1}`
+            ),
+            stdin:
+                typeof testCase?.stdin === 'string'
+                    ? testCase.stdin
+                    : typeof testCase?.input === 'string'
+                        ? testCase.input
+                        : '',
+            expected_output:
+                typeof testCase?.expected_output === 'string'
+                    ? testCase.expected_output
+                    : typeof testCase?.expectedOutput === 'string'
+                        ? testCase.expectedOutput
+                        : typeof testCase?.output === 'string'
+                            ? testCase.output
+                            : '',
+        }))
+        .filter((testCase: CodeTestCase) => testCase.stdin || testCase.expected_output);
+};
+
+const parseSubmissionCodeByLanguage = (submission: string): Record<string, string> => {
+    const lines = submission.split('\n');
+    const codeByLanguage: Record<string, string> = {};
+
+    let currentLanguage = '';
+    let buffer: string[] = [];
+
+    const flushBuffer = () => {
+        if (!currentLanguage) {
+            buffer = [];
+            return;
+        }
+
+        const code = buffer.join('\n').trim();
+        if (code) {
+            codeByLanguage[currentLanguage] = code;
+        }
+
+        buffer = [];
+    };
+
+    for (const line of lines) {
+        const languageHeader = line.match(/^\/\/\s*([A-Za-z0-9#+.-]+)\s*$/);
+        if (languageHeader) {
+            flushBuffer();
+            currentLanguage = normaliseCodeLanguage(languageHeader[1]);
+            continue;
+        }
+
+        buffer.push(line);
+    }
+
+    flushBuffer();
+
+    if (Object.keys(codeByLanguage).length === 0 && submission.trim()) {
+        codeByLanguage.javascript = submission.trim();
+    }
+
+    return codeByLanguage;
+};
+
+const extractLatestTestCaseEvidenceFromHistory = (history: ChatMessage[]): FeedbackEvidence[] => {
+    for (let index = history.length - 1; index >= 0; index -= 1) {
+        const message = history[index];
+        if (message.sender !== 'ai') {
+            continue;
+        }
+
+        const criteria = message.feedbackOutput?.criteria || [];
+        const evidence = criteria
+            .flatMap((criterion) => Array.isArray(criterion.evidence) ? criterion.evidence : [])
+            .filter((item) => item?.type === 'test_case');
+
+        if (evidence.length > 0) {
+            return evidence.slice(0, 3);
+        }
+    }
+
+    return [];
+};
 
 export default function LearnerQuizView({
     questions = [],
@@ -186,6 +325,10 @@ export default function LearnerQuizView({
 
     // New state to track which scorecard we're viewing
     const [activeScorecard, setActiveScorecard] = useState<ScorecardItem[]>([]);
+    const [activeAttemptId, setActiveAttemptId] = useState<number | undefined>(undefined);
+    const [activeDiffFromPrevious, setActiveDiffFromPrevious] = useState<FeedbackCriterionDiff[]>([]);
+    const [isReevaluating, setIsReevaluating] = useState(false);
+    const [feedbackAttemptHistory, setFeedbackAttemptHistory] = useState<Record<string, FeedbackAttemptSummary[]>>({});
 
     // Add state to remember chat scroll position
     const [chatScrollPosition, setChatScrollPosition] = useState(0);
@@ -419,10 +562,30 @@ export default function LearnerQuizView({
                                 chatMessage.content = contentObj.feedback;
                             }
 
+                            // Extract normalized feedback output if available
+                            if (contentObj && contentObj.feedback_output) {
+                                chatMessage.feedbackOutput = contentObj.feedback_output;
+                            }
+
                             // Extract scorecard if available
                             if (contentObj && contentObj.scorecard) {
                                 // Convert scorecard dict to list format
-                                chatMessage.scorecard = convertScorecardToList(contentObj.scorecard);
+                                chatMessage.scorecard = convertScorecardToList(
+                                    contentObj.scorecard,
+                                    contentObj.feedback_output
+                                );
+                            } else if (contentObj?.feedback_output?.criteria) {
+                                chatMessage.scorecard = convertNormalizedCriteriaToScorecard(
+                                    contentObj.feedback_output.criteria
+                                );
+                            }
+
+                            if (contentObj && contentObj.attempt_id !== undefined) {
+                                chatMessage.attemptId = contentObj.attempt_id;
+                            }
+
+                            if (contentObj && contentObj.diff_from_previous) {
+                                chatMessage.diffFromPrevious = contentObj.diff_from_previous;
                             }
 
                             // Extract is_correct if available
@@ -479,23 +642,193 @@ export default function LearnerQuizView({
     }, [isTestMode, userId, validQuestions, isChatHistoryLoaded, taskId]);
 
 
-    // Helper function to convert new scorecard dict format to list format
-    const convertScorecardToList = (scorecardDict: any): ScorecardItem[] => {
-        if (!scorecardDict || typeof scorecardDict !== 'object') {
+    const convertNormalizedCriteriaToScorecard = (criteria: any[]): ScorecardItem[] => {
+        if (!Array.isArray(criteria)) {
             return [];
         }
 
-        // Check if it's already in list format (backwards compatibility)
-        if (Array.isArray(scorecardDict)) {
-            return scorecardDict;
-        }
-
-        // Convert dict format to list format
-        return Object.entries(scorecardDict).map(([category, data]: [string, any]) => ({
-            category,
-            ...data
+        return criteria.map((criterion: any) => ({
+            category: criterion.criterion_name || 'Criterion',
+            feedback: {
+                correct: '',
+                wrong: criterion?.next_step || '',
+            },
+            score: Number(criterion?.score || 0),
+            max_score: Number(criterion?.max_score || 0),
+            pass_score: Number(criterion?.pass_score || 0),
+            evidence: Array.isArray(criterion?.evidence) ? criterion.evidence : [],
+            next_step: criterion?.next_step || '',
+            severity: criterion?.severity,
         }));
     };
+
+    const mergeFeedbackOutputIntoScorecard = (
+        scorecard: ScorecardItem[],
+        feedbackOutput?: FeedbackOutput
+    ): ScorecardItem[] => {
+        if (!feedbackOutput?.criteria || feedbackOutput.criteria.length === 0) {
+            return scorecard;
+        }
+
+        const criterionByName = new Map(
+            feedbackOutput.criteria.map((criterion) => [criterion.criterion_name, criterion])
+        );
+
+        return scorecard.map((item) => {
+            const criterion = criterionByName.get(item.category);
+            if (!criterion) {
+                return item;
+            }
+
+            return {
+                ...item,
+                evidence: criterion.evidence,
+                next_step: criterion.next_step,
+                severity: criterion.severity,
+            };
+        });
+    };
+
+    // Helper function to convert new scorecard dict format to list format
+    const convertScorecardToList = (
+        scorecardDict: any,
+        feedbackOutput?: FeedbackOutput
+    ): ScorecardItem[] => {
+        if (!scorecardDict) {
+            return feedbackOutput?.criteria
+                ? convertNormalizedCriteriaToScorecard(feedbackOutput.criteria)
+                : [];
+        }
+
+        if (Array.isArray(scorecardDict)) {
+            return mergeFeedbackOutputIntoScorecard(scorecardDict, feedbackOutput);
+        }
+
+        if (typeof scorecardDict !== 'object') {
+            return [];
+        }
+
+        const scorecard = Object.entries(scorecardDict).map(([category, data]: [string, any]) => ({
+            category,
+            ...data,
+        })) as ScorecardItem[];
+
+        return mergeFeedbackOutputIntoScorecard(scorecard, feedbackOutput);
+    };
+
+    const fetchFeedbackAttempts = useCallback(async (questionId: string) => {
+        if (isTestMode || !userId || !taskId || !questionId) {
+            return;
+        }
+
+        try {
+            const params = new URLSearchParams({
+                user_id: String(userId),
+                task_id: String(taskId),
+                question_id: String(questionId),
+                limit: '20',
+            });
+
+            const response = await fetch(
+                `${process.env.NEXT_PUBLIC_BACKEND_URL}/ai/feedback/attempts?${params.toString()}`
+            );
+
+            if (!response.ok) {
+                throw new Error('Failed to fetch feedback attempts');
+            }
+
+            const attempts = await response.json();
+            setFeedbackAttemptHistory((prev) => ({
+                ...prev,
+                [questionId]: Array.isArray(attempts) ? attempts : [],
+            }));
+        } catch (error) {
+            console.error('Error fetching feedback attempts:', error);
+        }
+    }, [isTestMode, userId, taskId]);
+
+    const evaluateCodeSubmissionEvidence = useCallback(async (
+        submissionContent: string,
+        questionConfig?: any,
+    ): Promise<FeedbackEvidence[]> => {
+        const testCases = extractCodeTestCasesFromSettings(questionConfig?.settings);
+        if (!submissionContent?.trim() || testCases.length === 0) {
+            return [];
+        }
+
+        const codeByLanguage = parseSubmissionCodeByLanguage(submissionContent);
+        const preferredLanguages = Array.isArray(questionConfig?.codingLanguages)
+            ? questionConfig?.codingLanguages.map((language) => normaliseCodeLanguage(String(language)))
+            : [];
+
+        const candidateLanguages = [
+            ...preferredLanguages,
+            ...Object.keys(codeByLanguage),
+        ];
+
+        const selectedLanguage = candidateLanguages.find((language) => {
+            return Boolean(JUDGE0_LANGUAGE_IDS[language] && codeByLanguage[language]?.trim());
+        });
+
+        if (!selectedLanguage) {
+            return [];
+        }
+
+        try {
+            const response = await fetch('/api/code/evaluate', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    source_code: codeByLanguage[selectedLanguage],
+                    language_id: JUDGE0_LANGUAGE_IDS[selectedLanguage],
+                    test_cases: testCases,
+                }),
+            });
+
+            if (!response.ok) {
+                return [];
+            }
+
+            const payload = await response.json();
+            const evidence = Array.isArray(payload?.evidence) ? payload.evidence : [];
+
+            return evidence
+                .filter((item: any) => item?.type === 'test_case' && item?.reference)
+                .map((item: any) => ({
+                    type: 'test_case' as const,
+                    reference: String(item.reference),
+                    description: String(item.description || ''),
+                }))
+                .slice(0, 3);
+        } catch (error) {
+            console.error('Error evaluating code submission with test cases:', error);
+            return [];
+        }
+    }, []);
+
+    useEffect(() => {
+        const currentQuestion = validQuestions[currentQuestionIndex];
+        const questionId = currentQuestion?.id ? String(currentQuestion.id) : '';
+
+        if (!isChatHistoryLoaded || !questionId) {
+            return;
+        }
+
+        if (currentQuestion?.config?.questionType !== 'subjective') {
+            setActiveAttemptId(undefined);
+            setActiveDiffFromPrevious([]);
+            return;
+        }
+
+        fetchFeedbackAttempts(questionId);
+    }, [
+        currentQuestionIndex,
+        validQuestions,
+        isChatHistoryLoaded,
+        fetchFeedbackAttempts,
+    ]);
 
     // Effect to focus the input when the question changes
     useEffect(() => {
@@ -659,12 +992,15 @@ export default function LearnerQuizView({
         const currentQuestion = validQuestions.find(q => q.id === questionId);
 
         // Create content based on the response type
-        let contentObj = {};
+        let contentObj: Record<string, any> = {};
         if (currentQuestion?.config?.questionType === 'subjective') {
-            // For report type, include both feedback and scorecard
+            // For report type, include both feedback and scorecard + normalized feedback metadata
             contentObj = {
                 feedback: aiResponse.feedback,
-                scorecard: aiResponse.scorecard || []
+                scorecard: aiResponse.scorecard || [],
+                ...(aiResponse.feedback_output ? { feedback_output: aiResponse.feedback_output } : {}),
+                ...(aiResponse.attempt_id !== undefined ? { attempt_id: aiResponse.attempt_id } : {}),
+                ...(aiResponse.diff_from_previous ? { diff_from_previous: aiResponse.diff_from_previous } : {}),
             };
         } else {
             // For chat type or any other type, just include feedback
@@ -715,7 +1051,7 @@ export default function LearnerQuizView({
         } catch (error) {
             console.error('Error storing chat history:', error);
         }
-    }, [userId, isTestMode, completedQuestionIds, validQuestions]);
+    }, [userId, isTestMode, completedQuestionIds, validQuestions, taskId]);
 
     // Process a user response (shared logic between text and audio submission)
     const processUserResponse = useCallback(
@@ -823,8 +1159,17 @@ export default function LearnerQuizView({
                 // Format the chat history for the current question
                 const formattedChatHistory = (chatHistories[currentQuestionId] || []).map(msg => ({
                     role: msg.sender === 'user' ? 'user' : 'assistant',
-                    content: msg.sender === 'user' ? msg.content :
-                        validQuestions[currentQuestionIndex].config.questionType === 'objective' ? JSON.stringify({ feedback: msg.content }) : JSON.stringify({ feedback: msg.content, scorecard: msg.scorecard }),
+                    content: msg.sender === 'user'
+                        ? msg.content
+                        : validQuestions[currentQuestionIndex].config.questionType === 'objective'
+                            ? JSON.stringify({ feedback: msg.content })
+                            : JSON.stringify({
+                                feedback: msg.content,
+                                scorecard: msg.scorecard,
+                                ...(msg.feedbackOutput ? { feedback_output: msg.feedbackOutput } : {}),
+                                ...(msg.attemptId !== undefined ? { attempt_id: msg.attemptId } : {}),
+                                ...(msg.diffFromPrevious ? { diff_from_previous: msg.diffFromPrevious } : {}),
+                            }),
                     response_type: msg.messageType,
                     audio_data: msg.audioData
                 }));
@@ -867,6 +1212,22 @@ export default function LearnerQuizView({
                     task_id: taskId,
                     task_type: 'quiz'
                 };
+            }
+
+            let codeEvidenceForRequest: FeedbackEvidence[] = [];
+
+            if (responseType === 'code') {
+                codeEvidenceForRequest = await evaluateCodeSubmissionEvidence(
+                    responseContent,
+                    validQuestions[currentQuestionIndex]?.config,
+                );
+
+                if (codeEvidenceForRequest.length > 0) {
+                    requestBody = {
+                        ...requestBody,
+                        code_evidence: codeEvidenceForRequest,
+                    };
+                }
             }
 
             // Create a message ID for the streaming response
@@ -1010,16 +1371,15 @@ export default function LearnerQuizView({
                     const processStream = async () => {
                         try {
                             let accumulatedFeedback = "";
-                            // Add a variable to collect the complete scorecard
                             let completeScorecard: ScorecardItem[] = [];
-                            // Add a flag to track if streaming is done
-                            let streamingComplete = false;
+                            let latestFeedbackOutput: FeedbackOutput | undefined;
+                            let latestAttemptId: number | undefined;
+                            let latestDiffFromPrevious: FeedbackCriterionDiff[] | undefined;
 
                             while (true) {
                                 const { done, value } = await reader.read();
 
                                 if (done) {
-                                    streamingComplete = true;
                                     break;
                                 }
 
@@ -1086,19 +1446,41 @@ export default function LearnerQuizView({
                                             }
                                         }
 
+                                        if (data.feedback_output) {
+                                            latestFeedbackOutput = data.feedback_output;
+
+                                            if (!data.scorecard && Array.isArray(data.feedback_output?.criteria)) {
+                                                completeScorecard = convertNormalizedCriteriaToScorecard(
+                                                    data.feedback_output.criteria
+                                                );
+                                            } else if (completeScorecard.length > 0) {
+                                                completeScorecard = mergeFeedbackOutputIntoScorecard(
+                                                    completeScorecard,
+                                                    latestFeedbackOutput
+                                                );
+                                            }
+                                        }
+
+                                        if (data.attempt_id !== undefined) {
+                                            latestAttemptId = data.attempt_id;
+                                        }
+
+                                        if (Array.isArray(data.diff_from_previous)) {
+                                            latestDiffFromPrevious = data.diff_from_previous;
+                                        }
+
                                         // Handle scorecard data when available
                                         if (data.scorecard) {
-                                            // Convert scorecard dict to list format
-                                            const scorecardList = convertScorecardToList(data.scorecard);
-                                            
+                                            const scorecardList = convertScorecardToList(
+                                                data.scorecard,
+                                                latestFeedbackOutput
+                                            );
+
                                             if (scorecardList.length > 0) {
-                                                // Show preparing report message if not already shown
                                                 if (!showPreparingReport && validQuestions[currentQuestionIndex]?.config?.responseType === 'chat') {
                                                     setShowPreparingReport(true);
                                                 }
 
-                                                // Instead of immediately updating the chat message,
-                                                // collect the scorecard data
                                                 completeScorecard = scorecardList;
                                             }
                                         }
@@ -1141,7 +1523,10 @@ export default function LearnerQuizView({
                                         // Update the existing message with the complete scorecard
                                         currentHistory[aiMessageIndex] = {
                                             ...currentHistory[aiMessageIndex],
-                                            scorecard: completeScorecard
+                                            scorecard: completeScorecard,
+                                            feedbackOutput: latestFeedbackOutput,
+                                            attemptId: latestAttemptId,
+                                            diffFromPrevious: latestDiffFromPrevious,
                                         };
                                     }
 
@@ -1157,7 +1542,12 @@ export default function LearnerQuizView({
                                 // Auto-open the scorecard when report is ready if not exam question
                                 if (completeScorecard && completeScorecard.length > 0 &&
                                     validQuestions[currentQuestionIndex]?.config?.responseType !== 'exam') {
-                                    handleViewScorecard(completeScorecard);
+                                    handleViewScorecard(
+                                        completeScorecard,
+                                        undefined,
+                                        latestAttemptId,
+                                        latestFeedbackOutput
+                                    );
                                 }
                             }
 
@@ -1216,9 +1606,16 @@ export default function LearnerQuizView({
                                 const aiResponse: AIResponse = {
                                     feedback: accumulatedFeedback,
                                     is_correct: isCorrect,
-                                    scorecard: completeScorecard
+                                    scorecard: completeScorecard,
+                                    feedback_output: latestFeedbackOutput,
+                                    attempt_id: latestAttemptId,
+                                    diff_from_previous: latestDiffFromPrevious,
                                 };
                                 storeChatHistory(currentQuestionId, userMessage, aiResponse);
+
+                                if (latestAttemptId !== undefined) {
+                                    fetchFeedbackAttempts(String(currentQuestionId));
+                                }
                             }
                         } catch (error) {
                             console.error('Error processing stream:', error);
@@ -1292,7 +1689,9 @@ export default function LearnerQuizView({
             chatHistories,
             storeChatHistory,
             completedQuestionIds,
-            EXAM_CONFIRMATION_MESSAGE
+            EXAM_CONFIRMATION_MESSAGE,
+            fetchFeedbackAttempts,
+            evaluateCodeSubmissionEvidence,
         ]
     );
 
@@ -1437,13 +1836,35 @@ export default function LearnerQuizView({
     `;
 
     // ScoreCard view toggle functions
-    const handleViewScorecard = (scorecard: ScorecardItem[]) => {
+    const handleViewScorecard = (
+        scorecard: ScorecardItem[],
+        message?: ChatMessage,
+        explicitAttemptId?: number,
+        feedbackOutput?: FeedbackOutput,
+        explicitDiff?: FeedbackCriterionDiff[],
+    ) => {
         // Save current chat scroll position before switching views
         if (chatContainerRef.current) {
             setChatScrollPosition(chatContainerRef.current.scrollTop);
         }
 
-        setActiveScorecard(scorecard);
+        const mergedScorecard = mergeFeedbackOutputIntoScorecard(
+            scorecard,
+            feedbackOutput || message?.feedbackOutput,
+        );
+
+        setActiveScorecard(mergedScorecard);
+        setActiveAttemptId(
+            explicitAttemptId
+            ?? message?.attemptId
+            ?? feedbackOutput?.attempt_id
+            ?? message?.feedbackOutput?.attempt_id
+        );
+        setActiveDiffFromPrevious(
+            explicitDiff
+            ?? message?.diffFromPrevious
+            ?? []
+        );
         setIsViewingScorecard(true);
 
         // Reset scroll position of scorecard view when opened
@@ -1469,6 +1890,149 @@ export default function LearnerQuizView({
             }
         }, 0);
     };
+
+    const handleReevaluate = useCallback(async () => {
+        const currentQuestion = validQuestions[currentQuestionIndex];
+        const currentQuestionId = currentQuestion?.id ? String(currentQuestion.id) : '';
+
+        if (!currentQuestionId || !taskId || !userId) {
+            return;
+        }
+
+        if (currentQuestion?.config?.questionType !== 'subjective') {
+            return;
+        }
+
+        const fullHistory = chatHistories[currentQuestionId] || [];
+        const latestUserMessage = [...fullHistory].reverse().find((message) => message.sender === 'user');
+
+        if (!latestUserMessage || !latestUserMessage.content?.trim()) {
+            setToastData({
+                title: 'No submission found',
+                description: 'Submit an answer before re-evaluating.',
+                emoji: '⚠️',
+            });
+            setShowToast(true);
+            return;
+        }
+
+        const isCodeSubmission = currentQuestion?.config?.inputType === 'code' || latestUserMessage.messageType === 'code';
+        const latestCodeEvidence = isCodeSubmission
+            ? extractLatestTestCaseEvidenceFromHistory(fullHistory)
+            : [];
+
+        setIsReevaluating(true);
+
+        try {
+            const response = await fetch(`${process.env.NEXT_PUBLIC_BACKEND_URL}/ai/feedback/re-evaluate`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    user_id: Number(userId),
+                    user_email: user?.email,
+                    task_id: Number(taskId),
+                    question_id: Number(currentQuestionId),
+                    task_type: 'quiz',
+                    latest_submission: latestUserMessage.content,
+                    response_type: isCodeSubmission ? 'code' : 'text',
+                    ...(latestCodeEvidence.length > 0 ? { code_evidence: latestCodeEvidence } : {}),
+                }),
+            });
+
+            if (!response.ok) {
+                throw new Error(`Failed to re-evaluate submission: ${response.status}`);
+            }
+
+            const payload = await response.json();
+            const feedbackOutput: FeedbackOutput = {
+                feedback_summary: payload.feedback_summary,
+                criteria: payload.criteria || [],
+                overall_score: payload.overall_score,
+                attempt_id: payload.attempt_id,
+            };
+
+            const scorecard = convertScorecardToList(payload.scorecard, feedbackOutput);
+            const aiMessage: ChatMessage = {
+                id: `ai-reevaluate-${Date.now()}`,
+                content: payload.feedback || payload.feedback_summary || 'Feedback updated.',
+                sender: 'ai',
+                timestamp: new Date(),
+                messageType: 'text',
+                scorecard,
+                feedbackOutput,
+                attemptId: payload.attempt_id,
+                diffFromPrevious: payload.diff_from_previous,
+            };
+
+            setChatHistories((prev) => ({
+                ...prev,
+                [currentQuestionId]: [...(prev[currentQuestionId] || []), aiMessage],
+            }));
+
+            handleViewScorecard(
+                scorecard,
+                aiMessage,
+                payload.attempt_id,
+                feedbackOutput,
+            );
+
+            await fetchFeedbackAttempts(currentQuestionId);
+
+            if (!isTestMode) {
+                const assistantPayload = JSON.stringify({
+                    feedback: aiMessage.content,
+                    scorecard: payload.scorecard || scorecard,
+                    feedback_output: feedbackOutput,
+                    attempt_id: payload.attempt_id,
+                    diff_from_previous: payload.diff_from_previous,
+                });
+
+                await fetch(`${process.env.NEXT_PUBLIC_BACKEND_URL}/chat/?userId=${encodeURIComponent(userId)}&taskId=${encodeURIComponent(taskId || '')}&questionId=${encodeURIComponent(String(currentQuestionId))}`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        user_id: Number(userId),
+                        question_id: Number(currentQuestionId),
+                        messages: [
+                            {
+                                role: 'assistant',
+                                content: assistantPayload,
+                                response_type: null,
+                                created_at: new Date(),
+                            },
+                        ],
+                        is_complete: false,
+                    }),
+                });
+            }
+        } catch (error) {
+            console.error('Error re-evaluating submission:', error);
+            setToastData({
+                title: 'Re-evaluation failed',
+                description: 'Please try again in a moment.',
+                emoji: '⚠️',
+            });
+            setShowToast(true);
+        } finally {
+            setIsReevaluating(false);
+        }
+    }, [
+        validQuestions,
+        currentQuestionIndex,
+        taskId,
+        userId,
+        user?.email,
+        chatHistories,
+        isTestMode,
+        handleViewScorecard,
+        fetchFeedbackAttempts,
+        convertScorecardToList,
+        mergeFeedbackOutputIntoScorecard,
+    ]);
 
     // Function to handle retrying the last user message
     const handleRetry = useCallback(() => {
@@ -2094,6 +2658,10 @@ export default function LearnerQuizView({
                             activeScorecard={activeScorecard}
                             handleBackToChat={handleBackToChat}
                             lastUserMessage={getLastUserMessage as ChatMessage | null}
+                            feedbackAttempts={feedbackAttemptHistory[String(validQuestions[currentQuestionIndex]?.id || '')] || []}
+                            activeAttemptId={activeAttemptId}
+                            onReevaluate={handleReevaluate}
+                            isReevaluating={isReevaluating}
                         />
                     ) : (
                         /* Use the ChatView component */

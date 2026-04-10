@@ -131,7 +131,17 @@ const LearnerScorecard: React.FC<LearnerScorecardProps> = ({
                                     <div>
                                         <div className="text-sm font-medium text-slate-900 dark:text-white">
                                             <div className="flex items-center space-x-2">
-                                                <div>{item.category} </div>
+                                                <div>{item.category}</div>
+                                                {item.severity && (
+                                                    <span className={`text-[10px] px-2 py-0.5 rounded-full border ${item.severity === 'high'
+                                                        ? 'text-rose-700 border-rose-200 bg-rose-50 dark:text-rose-300 dark:border-rose-900/40 dark:bg-rose-900/20'
+                                                        : item.severity === 'medium'
+                                                            ? 'text-amber-700 border-amber-200 bg-amber-50 dark:text-amber-300 dark:border-amber-900/40 dark:bg-amber-900/20'
+                                                            : 'text-emerald-700 border-emerald-200 bg-emerald-50 dark:text-emerald-300 dark:border-emerald-900/40 dark:bg-emerald-900/20'
+                                                        }`}>
+                                                        {item.severity}
+                                                    </span>
+                                                )}
                                                 <div className="flex items-center space-x-2">
                                                     <svg
                                                         className={`w-4 h-4 ${item.score >= item.pass_score ? 'text-emerald-500' : 'text-rose-500'}`}
@@ -191,6 +201,30 @@ const LearnerScorecard: React.FC<LearnerScorecardProps> = ({
                                                         <p className="text-xs text-amber-700 dark:text-amber-300/80">{item.feedback.wrong}</p>
                                                     </div>
                                                 </div>
+                                            </div>
+                                        )}
+
+                                        {item.evidence && item.evidence.length > 0 && (
+                                            <div className="rounded-lg p-3 border border-indigo-200 bg-indigo-50 dark:border-indigo-900/40 dark:bg-indigo-900/10">
+                                                <h4 className="text-xs font-medium mb-2 text-indigo-800 dark:text-indigo-300">Evidence</h4>
+                                                <div className="flex flex-wrap gap-2">
+                                                    {item.evidence.map((evidence, evidenceIndex) => (
+                                                        <span
+                                                            key={`${item.category}-evidence-${evidenceIndex}`}
+                                                            className="text-[11px] px-2 py-1 rounded-full border border-indigo-200 text-indigo-700 bg-white dark:bg-zinc-900 dark:border-indigo-900/50 dark:text-indigo-300"
+                                                            title={evidence.description}
+                                                        >
+                                                            {evidence.type.replace('_', ' ')}: {evidence.reference}
+                                                        </span>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                        )}
+
+                                        {item.next_step && (
+                                            <div className="rounded-lg p-3 border border-slate-200 bg-slate-50 dark:border-zinc-700 dark:bg-zinc-800/60">
+                                                <h4 className="text-xs font-medium mb-1 text-slate-800 dark:text-slate-200">Next step</h4>
+                                                <p className="text-xs text-slate-700 dark:text-slate-300">{item.next_step}</p>
                                             </div>
                                         )}
                                     </div>
