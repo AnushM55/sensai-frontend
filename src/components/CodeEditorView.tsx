@@ -816,8 +816,8 @@ const CodeEditorView = forwardRef<CodeEditorViewHandle, CodeEditorViewProps>(({
                 memory_limit: 128000, // 128MB
                 stack_limit: 64000,  // 64MB
                 max_processes_and_or_threads: 60,
-                enable_per_process_and_thread_time_limit: false,
-                enable_per_process_and_thread_memory_limit: false,
+                enable_per_process_and_thread_time_limit: true,
+                enable_per_process_and_thread_memory_limit: true,
                 compiler_options: '',
                 command_line_arguments: '',
             };
