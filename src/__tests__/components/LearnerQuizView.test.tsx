@@ -566,6 +566,80 @@ describe('LearnerQuizView Component', () => {
             });
         });
 
+        it('retries code submissions with code response_type', async () => {
+            const codeQuestion = sampleQuestions[2];
+
+            mockFetch.mockImplementation((url: string, options?: RequestInit) => {
+                if (url.includes('/chat/user/')) {
+                    return Promise.resolve({
+                        ok: true,
+                        json: () => Promise.resolve([
+                            {
+                                id: 1,
+                                question_id: codeQuestion.id,
+                                role: 'user',
+                                content: '// JAVASCRIPT\nconsole.log("hello")',
+                                response_type: 'code',
+                                created_at: new Date().toISOString(),
+                            },
+                            {
+                                id: 2,
+                                question_id: codeQuestion.id,
+                                role: 'assistant',
+                                content: JSON.stringify({ feedback: 'Initial feedback' }),
+                                response_type: null,
+                                created_at: new Date().toISOString(),
+                            },
+                        ]),
+                    } as any);
+                }
+
+                if (url.includes('/ai/chat')) {
+                    return Promise.resolve({
+                        ok: true,
+                        body: {
+                            getReader: () => ({
+                                read: jest.fn()
+                                    .mockResolvedValueOnce({
+                                        done: false,
+                                        value: new TextEncoder().encode('{"feedback":"Retried code feedback"}'),
+                                    })
+                                    .mockResolvedValueOnce({ done: true }),
+                            }),
+                        },
+                    } as any);
+                }
+
+                return Promise.resolve({
+                    ok: true,
+                    json: () => Promise.resolve([]),
+                } as any);
+            });
+
+            render(
+                <LearnerQuizView
+                    {...defaultProps}
+                    questions={[codeQuestion]}
+                    currentQuestionId={String(codeQuestion.id)}
+                />
+            );
+
+            await waitFor(() => {
+                expect(screen.getByTestId('message-0')).toBeInTheDocument();
+            });
+
+            fireEvent.click(screen.getByTestId('retry-button'));
+
+            await waitFor(() => {
+                const aiChatCall = mockFetch.mock.calls.find(([calledUrl]: any[]) =>
+                    String(calledUrl).includes('/ai/chat')
+                );
+                expect(aiChatCall).toBeTruthy();
+                const requestBody = JSON.parse((aiChatCall?.[1] as RequestInit)?.body as string);
+                expect(requestBody.response_type).toBe('code');
+            });
+        });
+
         it('does not submit empty text answers', () => {
             render(<LearnerQuizView {...defaultProps} />);
 

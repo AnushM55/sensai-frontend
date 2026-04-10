@@ -2142,6 +2142,8 @@ export default function LearnerQuizView({
             if (lastUserMessage.audioData) {
                 processUserResponse('', 'audio', lastUserMessage.audioData);
             }
+        } else if (lastUserMessage.messageType === 'code') {
+            processUserResponse(lastUserMessage.content, 'code');
         } else {
             // For text messages, resubmit the text content
             processUserResponse(lastUserMessage.content);
