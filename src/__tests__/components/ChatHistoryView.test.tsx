@@ -168,8 +168,11 @@ describe('ChatHistoryView Component', () => {
         // Click the button
         fireEvent.click(viewReportButton);
 
-        // Verify the callback was called with the correct data
-        expect(mockOnViewScorecard).toHaveBeenCalledWith(mockScorecardMessage.scorecard);
+        // Verify the callback was called with scorecard + source message
+        expect(mockOnViewScorecard).toHaveBeenCalledWith(
+            mockScorecardMessage.scorecard,
+            expect.objectContaining({ id: mockScorecardMessage.id }),
+        );
     });
 
     it('displays "AI is thinking" animation when AI is responding', () => {

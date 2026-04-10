@@ -241,9 +241,7 @@ const ChatHistoryView: React.FC<ChatHistoryViewProps> = ({
         return (
             message.sender === 'ai' &&
             message.scorecard &&
-            message.scorecard.length > 0 &&
-            // Check if the current question is configured for report responses
-            currentQuestionConfig?.questionType === 'subjective'
+            message.scorecard.length > 0
         );
     };
 

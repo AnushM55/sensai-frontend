@@ -1051,7 +1051,7 @@ export default function LearnerCourseView({
                         {/* Mobile overlay - only shown when sidebar is open on mobile */}
                         {isSidebarOpen && (
                             <div
-                                className="fixed inset-0 z-10"
+                                className="fixed inset-0 z-10 lg:hidden"
                                 onClick={toggleSidebar}
                                 style={{ backgroundColor: 'rgba(0, 0, 0, 0.8)' }}
                                 aria-label="Close sidebar overlay"
@@ -1059,7 +1059,7 @@ export default function LearnerCourseView({
                         )}
 
                         {/* Sidebar with module tasks - hidden on mobile by default */}
-                        <div className={`${isSidebarOpen ? 'absolute inset-0' : 'hidden'} lg:relative lg:block w-64 ${isAdminView ? 'h-[calc(100vh-45px)]' : 'h-full'} border-r flex flex-col overflow-hidden z-10 bg-white dark:bg-[#121212] border-gray-200 dark:border-gray-800`}>
+                        <div className={`${isSidebarOpen ? 'absolute inset-0 lg:relative' : 'hidden'} w-64 ${isAdminView ? 'h-[calc(100vh-45px)]' : 'h-full'} border-r flex flex-col overflow-hidden z-10 bg-white dark:bg-[#121212] border-gray-200 dark:border-gray-800`}>
                             {/* Sidebar Header */}
                             <div className="p-5 border-b flex items-center justify-between border-gray-200 dark:border-gray-800 bg-gray-50 dark:!bg-[#0A0A0A]">
                                 <h3 className="text-lg font-light truncate text-gray-900 dark:text-white">
@@ -1068,7 +1068,7 @@ export default function LearnerCourseView({
                                 {/* Close button for mobile sidebar */}
                                 <button
                                     onClick={toggleSidebar}
-                                    className={`lg:hidden mr-3 flex-shrink-0 mt-1 ${completedTasks[activeItem?.id]
+                                    className={`mr-3 flex-shrink-0 mt-1 ${completedTasks[activeItem?.id]
                                         ? "text-black dark:text-white"
                                         : "text-gray-600 dark:text-gray-400 hover:text-black dark:hover:text-white"
                                         }`}
@@ -1209,7 +1209,7 @@ export default function LearnerCourseView({
                                     {/* Hamburger menu for mobile */}
                                     <button
                                         onClick={toggleSidebar}
-                                        className={`lg:hidden mr-3 flex-shrink-0 mt-1 ${completedTasks[activeItem?.id]
+                                        className={`mr-3 flex-shrink-0 mt-1 ${completedTasks[activeItem?.id]
                                             ? 'text-white'
                                             : 'text-gray-600 dark:text-gray-400 hover:text-black dark:hover:text-white'
                                             }`}

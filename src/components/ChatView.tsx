@@ -53,6 +53,9 @@ interface ChatViewProps {
     showUploadSection?: boolean;
     onFileUploaded?: (file: File) => void;
     onFileDownload?: (fileUuid: string, fileName: string) => void;
+    onReevaluate?: () => void;
+    isReevaluating?: boolean;
+    showReevaluateButton?: boolean;
 }
 
 export interface ChatViewHandle {
@@ -86,6 +89,9 @@ const ChatView = forwardRef<ChatViewHandle, ChatViewProps>(({
     showUploadSection = false,
     onFileUploaded,
     onFileDownload,
+    onReevaluate,
+    isReevaluating = false,
+    showReevaluateButton = false,
 }, ref) => {
     const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -613,6 +619,21 @@ const ChatView = forwardRef<ChatViewHandle, ChatViewProps>(({
                     {/* Input area with fixed position at bottom */}
                     {!viewOnly && (
                         <div className="pt-2 input-container bg-white border-t border-gray-200 dark:bg-[#111111] dark:border-transparent">
+                            {showReevaluateButton && onReevaluate && (
+                                <div className="mb-2 flex justify-end">
+                                    <button
+                                        onClick={onReevaluate}
+                                        disabled={isReevaluating || isAiResponding || isSubmitting}
+                                        className={`px-3 py-1.5 rounded-full text-xs transition-colors border ${isReevaluating || isAiResponding || isSubmitting
+                                            ? 'opacity-60 cursor-not-allowed bg-gray-100 text-gray-500 border-gray-200 dark:bg-zinc-800 dark:text-zinc-400 dark:border-zinc-700'
+                                            : 'bg-indigo-600 hover:bg-indigo-700 text-white border-indigo-600 dark:bg-indigo-500 dark:hover:bg-indigo-400 dark:border-indigo-500 cursor-pointer'
+                                            }`}
+                                        type="button"
+                                    >
+                                        {isReevaluating ? 'Re-evaluating...' : 'Re-evaluate'}
+                                    </button>
+                                </div>
+                            )}
                             {/* Learning Material Suggestions */}
                             {taskType === 'learning_material' && currentChatHistory.length === 0 && (
                                 <div className="mb-4">
@@ -749,7 +770,7 @@ const ChatView = forwardRef<ChatViewHandle, ChatViewProps>(({
 
     return (
         <div
-            className={`flex-1 flex flex-col px-3 sm:px-6 py-6 overflow-auto h-full chat-view-wrapper ${isViewingCode ? 'bg-gray-200 dark:!bg-[#111111]' : 'bg-white dark:bg-transparent'}`}
+            className={`flex-1 flex flex-col px-3 sm:px-6 py-6 overflow-hidden h-full min-h-0 chat-view-wrapper ${isViewingCode ? 'bg-gray-200 dark:!bg-[#111111]' : 'bg-white dark:bg-transparent'}`}
         >
             <style jsx global>{`
                 /* Code toggle colors (used by .code-toggle-switch via CSS vars) */
@@ -818,7 +839,7 @@ const ChatView = forwardRef<ChatViewHandle, ChatViewProps>(({
                         max-height: 100% !important;
                         display: flex !important;
                         flex-direction: column !important;
-                        overflow: auto !important;
+                        overflow: hidden !important;
                         padding-top: 0.75rem !important;
                         padding-bottom: 0.75rem !important;
                     }

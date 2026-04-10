@@ -121,6 +121,7 @@ export interface CriterionFeedbackItem {
     max_score: number;
     pass_score: number;
     evidence: FeedbackEvidence[];
+    improvement_areas?: string;
     next_step: string;
     severity: 'low' | 'medium' | 'high';
 }

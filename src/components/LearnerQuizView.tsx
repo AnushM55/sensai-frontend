@@ -16,10 +16,11 @@ import {
     FeedbackEvidence,
 } from "../types/quiz";
 import ChatView, { CodeViewState, ChatViewHandle } from './ChatView';
-import ScorecardView from './ScorecardView';
 import ConfirmationDialog from './ConfirmationDialog';
 import { getKnowledgeBaseContent } from './QuizEditor';
 import { CodePreview } from './CodeEditorView';
+import LearnerScorecard from './LearnerScorecard';
+import FeedbackTimeline from './FeedbackTimeline';
 import isEqual from 'lodash/isEqual';
 import { safeLocalStorage } from "@/lib/utils/localStorage";
 import { useAuth } from "@/lib/auth";
@@ -183,6 +184,10 @@ const extractLatestTestCaseEvidenceFromHistory = (history: ChatMessage[]): Feedb
     return [];
 };
 
+const clampPercentage = (value: number, min: number, max: number) => {
+    return Math.min(Math.max(value, min), max);
+};
+
 export default function LearnerQuizView({
     questions = [],
     onSubmitAnswer,
@@ -217,8 +222,6 @@ export default function LearnerQuizView({
             const index = questions.findIndex(q => String(q.id) === String(currentQuestionId));
             if (index !== -1) {
                 setCurrentQuestionIndex(index);
-                // Reset to chat view when changing questions
-                setIsViewingScorecard(false);
             }
         }
     }, [currentQuestionId, questions]);
@@ -320,18 +323,12 @@ export default function LearnerQuizView({
     // State to track if we should show the preparing report button
     const [showPreparingReport, setShowPreparingReport] = useState(false);
 
-    // New state to track if we're viewing a scorecard
-    const [isViewingScorecard, setIsViewingScorecard] = useState(false);
-
     // New state to track which scorecard we're viewing
     const [activeScorecard, setActiveScorecard] = useState<ScorecardItem[]>([]);
     const [activeAttemptId, setActiveAttemptId] = useState<number | undefined>(undefined);
     const [activeDiffFromPrevious, setActiveDiffFromPrevious] = useState<FeedbackCriterionDiff[]>([]);
     const [isReevaluating, setIsReevaluating] = useState(false);
     const [feedbackAttemptHistory, setFeedbackAttemptHistory] = useState<Record<string, FeedbackAttemptSummary[]>>({});
-
-    // Add state to remember chat scroll position
-    const [chatScrollPosition, setChatScrollPosition] = useState(0);
 
     // Add state for navigation confirmation dialog
     const [showNavigationConfirmation, setShowNavigationConfirmation] = useState(false);
@@ -343,11 +340,24 @@ export default function LearnerQuizView({
     // Reference to the chat container for scrolling
     const chatContainerRef = useRef<HTMLDivElement>(null);
 
-    // Add a reference for the scorecard container
-    const scorecardContainerRef = useRef<HTMLDivElement>(null);
-
     // Reference to the ChatView component
     const chatViewRef = useRef<ChatViewHandle>(null);
+
+    const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(true);
+
+    // Desktop pane widths (percentage based)
+    const [questionPaneWidth, setQuestionPaneWidth] = useState(36);
+    const [chatPaneWidth, setChatPaneWidth] = useState(62);
+    const [codePreviewWidth, setCodePreviewWidth] = useState(22);
+    const [activeResizeHandle, setActiveResizeHandle] = useState<'question' | 'chat-report' | 'code' | null>(null);
+    const resizeStartRef = useRef({
+        x: 0,
+        questionPaneWidth: 36,
+        chatPaneWidth: 62,
+        codePreviewWidth: 22,
+    });
+    const desktopContainerRef = useRef<HTMLDivElement>(null);
+    const middlePaneRef = useRef<HTMLDivElement>(null);
 
     // Store the current answer in a ref to avoid re-renders
     const currentAnswerRef = useRef(currentAnswer);
@@ -456,15 +466,48 @@ export default function LearnerQuizView({
             }
         }
 
-        return history;
-    }, [chatHistories, currentQuestionIndex, validQuestions, completedQuestionIds, pendingSubmissionQuestionIds, showLearnerView]);
+        if (activeAttemptId !== undefined) {
+            let selectedAttemptMessageIndex = -1;
 
-    // Get the last user message for the current question
-    const getLastUserMessage = useMemo(() => {
-        // Filter for user messages only
-        const userMessages = currentChatHistory.filter(msg => msg.sender === 'user');
-        // Return the last user message if exists
-        return userMessages.length > 0 ? userMessages[userMessages.length - 1] : null;
+            for (let index = history.length - 1; index >= 0; index -= 1) {
+                const message = history[index];
+                if (message.sender === 'ai' && message.attemptId === activeAttemptId) {
+                    selectedAttemptMessageIndex = index;
+                    break;
+                }
+            }
+
+            if (selectedAttemptMessageIndex !== -1) {
+                return history.slice(0, selectedAttemptMessageIndex + 1);
+            }
+        }
+
+        return history;
+    }, [chatHistories, currentQuestionIndex, validQuestions, completedQuestionIds, pendingSubmissionQuestionIds, showLearnerView, activeAttemptId]);
+
+    useEffect(() => {
+        const latestReportMessage = [...currentChatHistory]
+            .reverse()
+            .find((msg) => msg.sender === 'ai' && Array.isArray(msg.scorecard) && msg.scorecard.length > 0);
+
+        if (!latestReportMessage) {
+            setActiveScorecard([]);
+            setActiveAttemptId(undefined);
+            setActiveDiffFromPrevious([]);
+            return;
+        }
+
+        const mergedScorecard = mergeFeedbackOutputIntoScorecard(
+            latestReportMessage.scorecard || [],
+            latestReportMessage.feedbackOutput,
+        );
+
+        setActiveScorecard(mergedScorecard);
+        setActiveAttemptId(
+            latestReportMessage.attemptId
+            ?? latestReportMessage.feedbackOutput?.attempt_id
+        );
+        setActiveDiffFromPrevious(latestReportMessage.diffFromPrevious || []);
     }, [currentChatHistory]);
 
     // Fetch chat history from backend when component mounts or task changes
@@ -651,7 +694,7 @@ export default function LearnerQuizView({
             category: criterion.criterion_name || 'Criterion',
             feedback: {
                 correct: '',
-                wrong: criterion?.next_step || '',
+                wrong: criterion?.improvement_areas || criterion?.next_step || '',
             },
             score: Number(criterion?.score || 0),
             max_score: Number(criterion?.max_score || 0),
@@ -682,6 +725,10 @@ export default function LearnerQuizView({
 
             return {
                 ...item,
+                feedback: {
+                    ...(item.feedback || { correct: '', wrong: '' }),
+                    wrong: criterion.improvement_areas || item.feedback?.wrong || '',
+                },
                 evidence: criterion.evidence,
                 next_step: criterion.next_step,
                 severity: criterion.severity,
@@ -896,8 +943,6 @@ export default function LearnerQuizView({
             const newIndex = currentQuestionIndex - 1;
             setCurrentQuestionIndex(newIndex);
             setCurrentAnswer(""); // Reset answer when changing questions
-            // Reset to chat view when changing questions
-            setIsViewingScorecard(false);
 
             // Always notify parent component about question change
             if (onQuestionChange && validQuestions[newIndex]) {
@@ -925,8 +970,6 @@ export default function LearnerQuizView({
             const newIndex = currentQuestionIndex + 1;
             setCurrentQuestionIndex(newIndex);
             setCurrentAnswer(""); // Reset answer when changing questions
-            // Reset to chat view when changing questions
-            setIsViewingScorecard(false);
 
             // Always notify parent component about question change
             if (onQuestionChange && validQuestions[newIndex]) {
@@ -934,6 +977,19 @@ export default function LearnerQuizView({
             }
         }
     }, [currentQuestionIndex, validQuestions.length, onQuestionChange, validQuestions]);
+
+    const goToQuestionByIndex = useCallback((index: number) => {
+        if (index < 0 || index >= validQuestions.length || index === currentQuestionIndex) {
+            return;
+        }
+
+        setCurrentQuestionIndex(index);
+        setCurrentAnswer("");
+
+        if (onQuestionChange && validQuestions[index]) {
+            onQuestionChange(validQuestions[index].id);
+        }
+    }, [currentQuestionIndex, onQuestionChange, validQuestions]);
 
     // Handle navigation confirmation
     const handleNavigationConfirm = useCallback(() => {
@@ -1843,11 +1899,6 @@ export default function LearnerQuizView({
         feedbackOutput?: FeedbackOutput,
         explicitDiff?: FeedbackCriterionDiff[],
     ) => {
-        // Save current chat scroll position before switching views
-        if (chatContainerRef.current) {
-            setChatScrollPosition(chatContainerRef.current.scrollTop);
-        }
-
         const mergedScorecard = mergeFeedbackOutputIntoScorecard(
             scorecard,
             feedbackOutput || message?.feedbackOutput,
@@ -1865,31 +1916,36 @@ export default function LearnerQuizView({
             ?? message?.diffFromPrevious
             ?? []
         );
-        setIsViewingScorecard(true);
-
-        // Reset scroll position of scorecard view when opened
-        setTimeout(() => {
-            if (scorecardContainerRef.current) {
-                scorecardContainerRef.current.scrollTop = 0;
-            }
-        }, 0);
     };
 
-    const handleBackToChat = () => {
-        setIsViewingScorecard(false);
+    const handleSelectAttemptFromTimeline = useCallback((attempt: FeedbackAttemptSummary) => {
+        const currentQuestionId = String(validQuestions[currentQuestionIndex]?.id || '');
+        if (!currentQuestionId) {
+            return;
+        }
 
-        // Focus the input field when returning to chat if appropriate
-        setTimeout(() => {
-            if (inputRef.current) {
-                inputRef.current.focus();
-            }
+        const currentHistory = chatHistories[currentQuestionId] || [];
+        const matchedMessage = currentHistory.find((message) =>
+            message.sender === 'ai' &&
+            message.attemptId === attempt.attempt_id &&
+            Array.isArray(message.scorecard) &&
+            message.scorecard.length > 0
+        );
 
-            // Restore saved chat scroll position
-            if (chatContainerRef.current) {
-                chatContainerRef.current.scrollTop = chatScrollPosition;
-            }
-        }, 0);
-    };
+        if (!matchedMessage) {
+            setActiveAttemptId(attempt.attempt_id);
+            setActiveDiffFromPrevious([]);
+            return;
+        }
+
+        handleViewScorecard(
+            matchedMessage.scorecard || [],
+            matchedMessage,
+            attempt.attempt_id,
+            matchedMessage.feedbackOutput,
+            matchedMessage.diffFromPrevious,
+        );
+    }, [validQuestions, currentQuestionIndex, chatHistories, handleViewScorecard]);
 
     const handleReevaluate = useCallback(async () => {
         const currentQuestion = validQuestions[currentQuestionIndex];
@@ -1976,6 +2032,7 @@ export default function LearnerQuizView({
                 aiMessage,
                 payload.attempt_id,
                 feedbackOutput,
+                payload.diff_from_previous,
             );
 
             await fetchFeedbackAttempts(currentQuestionId);
@@ -2144,6 +2201,107 @@ export default function LearnerQuizView({
         return validQuestions[currentQuestionIndex]?.config?.inputType === 'code';
     }, [validQuestions, currentQuestionIndex]);
 
+    const shouldShowCodePreview = useMemo(() => {
+        if (!isCodeQuestion || !codeViewState.isViewingCode) {
+            return false;
+        }
+
+        return Boolean(
+            codeViewState.isRunning ||
+            codeViewState.previewContent?.trim() ||
+            codeViewState.output?.trim()
+        );
+    }, [isCodeQuestion, codeViewState]);
+
+    const startResize = useCallback((handle: 'question' | 'chat-report' | 'code', clientX: number) => {
+        resizeStartRef.current = {
+            x: clientX,
+            questionPaneWidth,
+            chatPaneWidth,
+            codePreviewWidth,
+        };
+        setActiveResizeHandle(handle);
+    }, [questionPaneWidth, chatPaneWidth, codePreviewWidth]);
+
+    useEffect(() => {
+        if (!activeResizeHandle) {
+            return;
+        }
+
+        const onMouseMove = (event: MouseEvent) => {
+            if (activeResizeHandle === 'chat-report') {
+                const middlePaneWidthPx = middlePaneRef.current?.getBoundingClientRect().width || 0;
+                if (!middlePaneWidthPx) {
+                    return;
+                }
+
+                const deltaPct = ((event.clientX - resizeStartRef.current.x) / middlePaneWidthPx) * 100;
+                const nextChatPaneWidth = clampPercentage(
+                    resizeStartRef.current.chatPaneWidth + deltaPct,
+                    35,
+                    75
+                );
+                setChatPaneWidth(nextChatPaneWidth);
+                return;
+            }
+
+            const containerWidthPx = desktopContainerRef.current?.getBoundingClientRect().width || 0;
+            if (!containerWidthPx) {
+                return;
+            }
+
+            const deltaPct = ((event.clientX - resizeStartRef.current.x) / containerWidthPx) * 100;
+
+            if (activeResizeHandle === 'question') {
+                const minQuestionWidth = 20;
+                const minMiddleWidth = 25;
+                const maxQuestionWidth = shouldShowCodePreview
+                    ? 100 - resizeStartRef.current.codePreviewWidth - minMiddleWidth
+                    : 70;
+
+                setQuestionPaneWidth(
+                    clampPercentage(
+                        resizeStartRef.current.questionPaneWidth + deltaPct,
+                        minQuestionWidth,
+                        maxQuestionWidth
+                    )
+                );
+                return;
+            }
+
+            if (activeResizeHandle === 'code' && shouldShowCodePreview) {
+                const minCodeWidth = 15;
+                const maxCodeWidth = 35;
+                const minMiddleWidth = 25;
+                const maxCodeByLayout = 100 - resizeStartRef.current.questionPaneWidth - minMiddleWidth;
+
+                setCodePreviewWidth(
+                    clampPercentage(
+                        resizeStartRef.current.codePreviewWidth - deltaPct,
+                        minCodeWidth,
+                        Math.min(maxCodeWidth, maxCodeByLayout)
+                    )
+                );
+            }
+        };
+
+        const onMouseUp = () => {
+            setActiveResizeHandle(null);
+        };
+
+        document.body.style.cursor = 'col-resize';
+        document.body.style.userSelect = 'none';
+        window.addEventListener('mousemove', onMouseMove);
+        window.addEventListener('mouseup', onMouseUp);
+
+        return () => {
+            document.body.style.cursor = '';
+            document.body.style.userSelect = '';
+            window.removeEventListener('mousemove', onMouseMove);
+            window.removeEventListener('mouseup', onMouseUp);
+        };
+    }, [activeResizeHandle, shouldShowCodePreview]);
+
     // Mobile view controls
     const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
     const [mobileViewMode, setMobileViewMode] = useState<'question-full' | 'chat-full' | 'split'>('split');
@@ -2256,6 +2414,13 @@ export default function LearnerQuizView({
         }
     }, [isAdminView, questions, currentQuestionId]);
 
+    const currentQuestionKey = String(validQuestions[currentQuestionIndex]?.id || '');
+    const canReevaluateCurrentQuestion = Boolean(
+        !viewOnly &&
+        currentQuestionConfig?.questionType === 'subjective' &&
+        (chatHistories[currentQuestionKey] || []).some((message) => message.sender === 'user')
+    );
+
     return (
         <div className={`w-full h-full ${className}`}>
             {/* Add the custom styles */}
@@ -2267,6 +2432,10 @@ export default function LearnerQuizView({
                     --quiz-input-container-bg: #ffffff;
                     --quiz-input-container-border: #e5e7eb;
                     --quiz-mobile-code-preview-bg: #f3f4f6;
+                    /* Desktop pane sizing controls (adjust these to tune layout quickly) */
+                    --quiz-question-pane-width: 36%;
+                    --quiz-chat-pane-width: 62%;
+                    --quiz-code-preview-width: 22%;
                 }
                 
                 :root.dark, .dark {
@@ -2297,7 +2466,7 @@ export default function LearnerQuizView({
             <style jsx>{`
                 .three-column-grid {
                     display: grid;
-                    grid-template-columns: 1fr 1fr 0.75fr;
+                    grid-template-columns: minmax(320px, var(--quiz-question-pane-width)) minmax(0, 1fr) minmax(260px, var(--quiz-code-preview-width));
                     height: 100%;
                     
                     @media (max-width: 1024px) {
@@ -2310,7 +2479,7 @@ export default function LearnerQuizView({
                 
                 .two-column-grid {
                     display: grid;
-                    grid-template-columns: 1fr 1fr;
+                    grid-template-columns: minmax(320px, var(--quiz-question-pane-width)) minmax(0, 1fr);
                     height: 100%;
                     
                     @media (max-width: 1024px) {
@@ -2372,6 +2541,11 @@ export default function LearnerQuizView({
                         display: flex !important;
                         flex-direction: column !important;
                         grid-row: 2 !important;
+                    }
+
+                    .chat-main-pane,
+                    .chat-report-pane {
+                        width: 100% !important;
                     }
                     
                     /* Ensure the messages area scrolls but input stays fixed */
@@ -2564,157 +2738,285 @@ export default function LearnerQuizView({
                 }
             `}</style>
 
-            <div
-                className={`overflow-hidden ${isCodeQuestion && codeViewState.isViewingCode ? 'three-column-grid' : 'two-column-grid'} bg-white border border-gray-200 shadow-sm dark:bg-[#111111] dark:border-[#222222] dark:shadow-none quiz-view-container`}
-            >
-                {/* Left side - Question (33% or 50% depending on layout) */}
-                <div className="p-6 flex flex-col lg:border-r lg:border-b-0 sm:border-b sm:border-r-0 question-container bg-white border-gray-200 dark:bg-[#1A1A1A] dark:border-[#222222]"
-                    style={{ overflow: 'auto' }}>
-                    {/* Navigation controls at the top of left side - only show if more than one question */}
-                    {validQuestions.length > 1 ? (
-                        <div className="flex items-center justify-between w-full mb-6">
-                            <div className="w-10 h-10">
-                                <button
-                                    className={`w-10 h-10 rounded-full flex items-center justify-center bg-gray-100 text-gray-600 dark:bg-[#222222] dark:text-white ${currentQuestionIndex > 0 ? 'hover:bg-gray-200 cursor-pointer dark:hover:bg-[#333333] cursor-pointer' : 'opacity-50 cursor-not-allowed'}`}
-                                    onClick={goToPreviousQuestion}
-                                    disabled={currentQuestionIndex <= 0}
-                                >
-                                    <ChevronLeft size={18} />
-                                </button>
-                            </div>
+            <div className="overflow-hidden flex h-full bg-white border border-gray-200 shadow-sm dark:bg-[#111111] dark:border-[#222222] dark:shadow-none">
+                <aside className={`hidden lg:flex flex-col border-r border-gray-200 dark:border-[#222222] bg-gray-50 dark:bg-[#141414] transition-all duration-200 ${isSidebarCollapsed ? 'w-16' : 'w-64'}`}>
+                    <div className="h-14 px-3 flex items-center justify-between border-b border-gray-200 dark:border-[#222222]">
+                        {!isSidebarCollapsed && (
+                            <span className="text-xs font-medium uppercase tracking-wide text-gray-600 dark:text-gray-300">
+                                Questions
+                            </span>
+                        )}
+                        <button
+                            className="w-8 h-8 rounded-full flex items-center justify-center bg-white text-gray-700 border border-gray-200 hover:bg-gray-100 dark:bg-[#1f1f1f] dark:text-white dark:border-[#2a2a2a] dark:hover:bg-[#2a2a2a] cursor-pointer"
+                            onClick={() => setIsSidebarCollapsed((prev) => !prev)}
+                            type="button"
+                            aria-label={isSidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+                        >
+                            <span className="text-sm font-semibold">{isSidebarCollapsed ? '>' : '<'}</span>
+                        </button>
+                    </div>
 
-                            <div className="px-3 py-1 rounded-full text-sm flex items-center bg-indigo-100 text-indigo-900 dark:bg-[#222222] dark:text-white">
-                                <span>Question {currentQuestionIndex + 1} / {validQuestions.length}</span>
-                                {validQuestions[currentQuestionIndex] &&
-                                    completedQuestionIds &&
-                                    completedQuestionIds[validQuestions[currentQuestionIndex].id] && (
-                                        <CheckCircle size={14} className="ml-2 flex-shrink-0 text-emerald-500 dark:text-green-500" />
+                    <div className="flex-1 overflow-y-auto p-2 space-y-2">
+                        {validQuestions.map((question, index) => {
+                            const questionId = String(question?.id || '');
+                            const isActive = index === currentQuestionIndex;
+                            const isCompleted = Boolean(completedQuestionIds?.[questionId]);
+                            const title = question?.config?.title?.trim() || `Question ${index + 1}`;
+
+                            return (
+                                <button
+                                    key={questionId || `question-${index}`}
+                                    onClick={() => goToQuestionByIndex(index)}
+                                    className={`w-full flex items-center gap-2 rounded-lg px-2 py-2 text-left cursor-pointer transition-colors border ${isActive
+                                        ? 'bg-indigo-50 border-indigo-200 text-indigo-900 dark:bg-[#232a3a] dark:border-[#2f3e5a] dark:text-white'
+                                        : 'bg-white border-gray-200 text-gray-700 hover:bg-gray-100 dark:bg-[#1a1a1a] dark:border-[#2a2a2a] dark:text-gray-300 dark:hover:bg-[#242424]'
+                                        }`}
+                                    type="button"
+                                >
+                                    <span className={`w-7 h-7 rounded-full shrink-0 flex items-center justify-center text-xs font-semibold ${isActive ? 'bg-indigo-600 text-white' : 'bg-gray-200 text-gray-700 dark:bg-[#2a2a2a] dark:text-gray-200'}`}>
+                                        {index + 1}
+                                    </span>
+                                    {!isSidebarCollapsed && (
+                                        <div className="min-w-0 flex-1">
+                                            <div className="text-sm truncate">{title}</div>
+                                        </div>
                                     )}
-                            </div>
-
-                            <div className="w-10 h-10">
-                                <button
-                                    className={`w-10 h-10 rounded-full flex items-center justify-center bg-gray-100 dark:bg-[#222222] text-gray-600 dark:text-white ${currentQuestionIndex < validQuestions.length - 1 ? 'hover:bg-gray-200 dark:hover:bg-[#333333] cursor-pointer' : 'opacity-50 cursor-not-allowed'}`}
-                                    onClick={goToNextQuestion}
-                                    disabled={currentQuestionIndex >= validQuestions.length - 1}
-                                >
-                                    <ChevronRight size={18} />
+                                    {isCompleted && <CheckCircle size={14} className="text-emerald-500 shrink-0" />}
                                 </button>
-                            </div>
-                        </div>
-                    ) : (
-                        <div className="flex items-center justify-center w-full mb-6">
-                            <div className="px-3 py-1 rounded-full text-sm bg-gray-100 text-gray-700 dark:bg-[#222222] dark:text-white">
-                                Question
-                            </div>
-                        </div>
-                    )}
+                            );
+                        })}
+                    </div>
+                </aside>
 
-                    <div className={`flex-1 ${questions.length > 1 ? 'mt-4' : ''}`}>
-                        {/* Use editor with negative margin to offset unwanted space */}
+                <div
+                    ref={desktopContainerRef}
+                    className={`relative flex-1 overflow-hidden ${shouldShowCodePreview ? 'three-column-grid' : 'two-column-grid'} quiz-view-container`}
+                    style={{
+                        gridTemplateColumns: shouldShowCodePreview
+                            ? `${questionPaneWidth}% ${100 - questionPaneWidth - codePreviewWidth}% ${codePreviewWidth}%`
+                            : `${questionPaneWidth}% ${100 - questionPaneWidth}%`,
+                    }}
+                >
+                    <div className="p-6 flex flex-col overflow-hidden lg:border-r lg:border-b-0 sm:border-b sm:border-r-0 question-container bg-white border-gray-200 dark:bg-[#1A1A1A] dark:border-[#222222]">
+                        {validQuestions.length > 1 ? (
+                            <div className="flex items-center justify-between w-full mb-4 shrink-0">
+                                <div className="w-10 h-10">
+                                    <button
+                                        className={`w-10 h-10 rounded-full flex items-center justify-center bg-gray-100 text-gray-600 dark:bg-[#222222] dark:text-white ${currentQuestionIndex > 0 ? 'hover:bg-gray-200 cursor-pointer dark:hover:bg-[#333333] cursor-pointer' : 'opacity-50 cursor-not-allowed'}`}
+                                        onClick={goToPreviousQuestion}
+                                        disabled={currentQuestionIndex <= 0}
+                                    >
+                                        <ChevronLeft size={18} />
+                                    </button>
+                                </div>
+
+                                <div className="px-3 py-1 rounded-full text-sm flex items-center bg-indigo-100 text-indigo-900 dark:bg-[#222222] dark:text-white">
+                                    <span>Question {currentQuestionIndex + 1} / {validQuestions.length}</span>
+                                    {validQuestions[currentQuestionIndex] &&
+                                        completedQuestionIds &&
+                                        completedQuestionIds[validQuestions[currentQuestionIndex].id] && (
+                                            <CheckCircle size={14} className="ml-2 flex-shrink-0 text-emerald-500 dark:text-green-500" />
+                                        )}
+                                </div>
+
+                                <div className="w-10 h-10">
+                                    <button
+                                        className={`w-10 h-10 rounded-full flex items-center justify-center bg-gray-100 dark:bg-[#222222] text-gray-600 dark:text-white ${currentQuestionIndex < validQuestions.length - 1 ? 'hover:bg-gray-200 dark:hover:bg-[#333333] cursor-pointer' : 'opacity-50 cursor-not-allowed'}`}
+                                        onClick={goToNextQuestion}
+                                        disabled={currentQuestionIndex >= validQuestions.length - 1}
+                                    >
+                                        <ChevronRight size={18} />
+                                    </button>
+                                </div>
+                            </div>
+                        ) : (
+                            <div className="flex items-center justify-center w-full mb-4 shrink-0">
+                                <div className="px-3 py-1 rounded-full text-sm bg-gray-100 text-gray-700 dark:bg-[#222222] dark:text-white">
+                                    Question
+                                </div>
+                            </div>
+                        )}
+
+                        <div className={`flex-1 overflow-y-auto ${questions.length > 1 ? 'mt-2' : ''}`}>
+                            <div
+                                className="ml-[-60px]"
+                                onCopy={(e) => {
+                                    if (disableCopyPaste) {
+                                        e.preventDefault();
+                                        e.stopPropagation();
+
+                                        setToastData({
+                                            title: 'Not allowed',
+                                            description: 'Copying is disabled for this question',
+                                            emoji: '🚫'
+                                        });
+                                        setShowToast(true);
+                                    }
+                                }}
+                            >
+                                {integrationBlocks.length > 0 ? (
+                                    <div className="px-20 pr-0 pb-6 rounded-lg bg-white text-gray-900 dark:bg-[#191919] dark:text-white">
+                                        <h1 className="text-4xl font-bold mb-4 pl-0.5 text-gray-900 dark:text-white">{integrationBlock?.props?.resource_name}</h1>
+                                        <RenderConfig theme={isDarkMode ? "dark" : "light"}>
+                                            <BlockList blocks={integrationBlocks} />
+                                        </RenderConfig>
+                                    </div>
+                                ) : (
+                                    <BlockNoteEditor
+                                        key={`question-view-${currentQuestionIndex}`}
+                                        initialContent={integrationBlock ? [] : initialContent}
+                                        onChange={() => { }}
+                                        readOnly={true}
+                                        className={`!bg-transparent ${isTestMode ? 'quiz-viewer-preview' : 'quiz-viewer'}`}
+                                        placeholder="Question content will appear here"
+                                    />
+                                )}
+                            </div>
+                        </div>
+                    </div>
+
+                    <div
+                        ref={middlePaneRef}
+                        className="relative flex flex-col lg:flex-row h-full min-h-0 lg:border-l lg:border-t-0 sm:border-t sm:border-l-0 chat-container bg-white border border-gray-200 dark:bg-[#111111] dark:border-[#222222]"
+                    >
                         <div
-                            className="ml-[-60px]"
-                            onCopy={(e) => {
-                                if (disableCopyPaste) {
-                                    e.preventDefault();
-                                    e.stopPropagation();
+                            className={`${!shouldShowCodePreview ? 'chat-main-pane lg:flex-none lg:border-r' : 'flex-1'} min-h-0 border-b lg:border-b-0 border-gray-200 dark:border-[#222222]`}
+                            style={!shouldShowCodePreview ? { width: `${chatPaneWidth}%` } : undefined}
+                        >
+                            <ChatView
+                                currentChatHistory={currentChatHistory as ChatMessage[]}
+                                isAiResponding={isAiResponding}
+                                showPreparingReport={showPreparingReport}
+                                isChatHistoryLoaded={isChatHistoryLoaded}
+                                isTestMode={isTestMode}
+                                taskType='quiz'
+                                currentQuestionConfig={validQuestions[currentQuestionIndex]?.config}
+                                isSubmitting={isSubmitting}
+                                currentAnswer={currentAnswer}
+                                handleInputChange={handleInputChange}
+                                handleSubmitAnswer={handleSubmitAnswer}
+                                handleAudioSubmit={handleAudioSubmit}
+                                handleViewScorecard={handleViewScorecard}
+                                viewOnly={viewOnly}
+                                completedQuestionIds={completedQuestionIds}
+                                currentQuestionId={validQuestions[currentQuestionIndex]?.id}
+                                handleRetry={handleRetry}
+                                onCodeStateChange={handleCodeStateChange}
+                                initialIsViewingCode={isCodeQuestion}
+                                showLearnerView={showLearnerView}
+                                onShowLearnerViewChange={setShowLearnerView}
+                                isAdminView={isAdminView}
+                                userId={userId}
+                                onReevaluate={handleReevaluate}
+                                isReevaluating={isReevaluating}
+                                showReevaluateButton={canReevaluateCurrentQuestion}
+                                ref={chatViewRef}
+                            />
+                        </div>
 
-                                    // Show toast
-                                    setToastData({
-                                        title: 'Not allowed',
-                                        description: 'Copying is disabled for this question',
-                                        emoji: '🚫'
-                                    });
-                                    setShowToast(true);
-                                }
-                            }}
-                        > {/* Increased negative margin to align with navigation arrow */}
-                            {integrationBlocks.length > 0 ? (
-                                <div className="px-20 pr-0 pb-6 rounded-lg bg-white text-gray-900 dark:bg-[#191919] dark:text-white">
-                                    <h1 className="text-4xl font-bold mb-4 pl-0.5 text-gray-900 dark:text-white">{integrationBlock?.props?.resource_name}</h1>
-                                    <RenderConfig theme={isDarkMode ? "dark" : "light"}>
-                                        <BlockList blocks={integrationBlocks} />
-                                    </RenderConfig>
+                        {!shouldShowCodePreview && (
+                        <div className="chat-report-pane min-h-0 lg:flex-none overflow-y-auto p-4 bg-gray-50 dark:bg-[#161616]" style={{ width: `${100 - chatPaneWidth}%` }}>
+                            <div className="flex items-center justify-between mb-3">
+                                <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-100">Report</h3>
+                                {activeAttemptId !== undefined && (
+                                    <span className="text-[11px] px-2 py-1 rounded-full bg-indigo-100 text-indigo-700 dark:bg-[#2b3252] dark:text-indigo-200">
+                                        Attempt #{activeAttemptId}
+                                    </span>
+                                )}
+                            </div>
+
+                            {activeScorecard.length > 0 ? (
+                                <div className="space-y-4">
+                                    <FeedbackTimeline
+                                        attempts={feedbackAttemptHistory[currentQuestionKey] || []}
+                                        activeAttemptId={activeAttemptId}
+                                        onAttemptSelect={handleSelectAttemptFromTimeline}
+                                    />
+
+                                    {activeDiffFromPrevious.length > 0 && (
+                                        <div className="rounded-xl p-3 bg-white border border-gray-200 dark:bg-zinc-900 dark:border-[#2a2a2a]">
+                                            <div className="flex flex-wrap gap-2">
+                                                {activeDiffFromPrevious.map((diff) => (
+                                                    <span
+                                                        key={`${diff.criterion_name}-${diff.change}`}
+                                                        className={`text-[11px] px-2 py-1 rounded-full border ${diff.change === 'improved'
+                                                            ? 'text-emerald-700 border-emerald-200 bg-emerald-50 dark:text-emerald-300 dark:border-emerald-900/40 dark:bg-emerald-900/20'
+                                                            : diff.change === 'regressed'
+                                                                ? 'text-rose-700 border-rose-200 bg-rose-50 dark:text-rose-300 dark:border-rose-900/40 dark:bg-rose-900/20'
+                                                                : 'text-slate-700 border-slate-200 bg-slate-50 dark:text-slate-300 dark:border-zinc-700 dark:bg-zinc-800/60'
+                                                            }`}
+                                                    >
+                                                        {diff.criterion_name}: {diff.change}
+                                                    </span>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    <LearnerScorecard scorecard={activeScorecard} className="mt-0" />
                                 </div>
                             ) : (
-                                <BlockNoteEditor
-                                    key={`question-view-${currentQuestionIndex}`}
-                                    initialContent={integrationBlock ? [] : initialContent}
-                                    onChange={() => { }} // Read-only in view mode
-                                    readOnly={true}
-                                    className={`!bg-transparent ${isTestMode ? 'quiz-viewer-preview' : 'quiz-viewer'}`}
-                                    placeholder="Question content will appear here"
-                                />
+                                <div className="h-full rounded-xl border border-dashed border-gray-300 dark:border-[#2a2a2a] bg-white/70 dark:bg-[#1b1b1b] flex items-center justify-center px-4 py-8 text-center">
+                                    <p className="text-sm text-gray-600 dark:text-gray-400">
+                                        The report will appear here after your submission is evaluated.
+                                    </p>
+                                </div>
                             )}
                         </div>
-                    </div>
-                </div>
+                        )}
 
-                {/* Middle column - Chat/Code View */}
-                <div className="flex flex-col h-full overflow-auto lg:border-l lg:border-t-0 sm:border-t sm:border-l-0 chat-container bg-white border border-gray-200 dark:bg-[#111111] dark:border-[#222222]">
-                    {isViewingScorecard ? (
-                        /* Use the ScorecardView component */
-                        <ScorecardView
-                            activeScorecard={activeScorecard}
-                            handleBackToChat={handleBackToChat}
-                            lastUserMessage={getLastUserMessage as ChatMessage | null}
-                            feedbackAttempts={feedbackAttemptHistory[String(validQuestions[currentQuestionIndex]?.id || '')] || []}
-                            activeAttemptId={activeAttemptId}
-                            onReevaluate={handleReevaluate}
-                            isReevaluating={isReevaluating}
-                        />
-                    ) : (
-                        /* Use the ChatView component */
-                        <ChatView
-                            currentChatHistory={currentChatHistory as ChatMessage[]}
-                            isAiResponding={isAiResponding}
-                            showPreparingReport={showPreparingReport}
-                            isChatHistoryLoaded={isChatHistoryLoaded}
-                            isTestMode={isTestMode}
-                            taskType='quiz'
-                            currentQuestionConfig={validQuestions[currentQuestionIndex]?.config}
-                            isSubmitting={isSubmitting}
-                            currentAnswer={currentAnswer}
-                            handleInputChange={handleInputChange}
-                            handleSubmitAnswer={handleSubmitAnswer}
-                            handleAudioSubmit={handleAudioSubmit}
-                            handleViewScorecard={handleViewScorecard}
-                            viewOnly={viewOnly}
-                            completedQuestionIds={completedQuestionIds}
-                            currentQuestionId={validQuestions[currentQuestionIndex]?.id}
-                            handleRetry={handleRetry}
-                            onCodeStateChange={handleCodeStateChange}
-                            initialIsViewingCode={isCodeQuestion}
-                            showLearnerView={showLearnerView}
-                            onShowLearnerViewChange={setShowLearnerView}
-                            isAdminView={isAdminView}
-                            userId={userId}
-                            ref={chatViewRef}
+                        {!shouldShowCodePreview && (
+                            <div
+                                className={`hidden lg:block absolute top-0 bottom-0 w-2 -ml-1 z-20 cursor-col-resize ${activeResizeHandle === 'chat-report' ? 'bg-indigo-400/40' : 'bg-transparent hover:bg-indigo-300/25'}`}
+                                style={{ left: `${chatPaneWidth}%` }}
+                                onMouseDown={(event) => {
+                                    event.preventDefault();
+                                    startResize('chat-report', event.clientX);
+                                }}
+                            />
+                        )}
+                    </div>
+
+                    {shouldShowCodePreview && (
+                        <div className="border-l h-full overflow-auto border-gray-200 bg-gray-50 dark:border-[#222222] dark:bg-[#111111]">
+                            <CodePreview
+                                isRunning={codeViewState.isRunning}
+                                previewContent={codeViewState.previewContent}
+                                output={codeViewState.output}
+                                isWebPreview={codeViewState.hasWebLanguages}
+                                executionTime={codeViewState.executionTime}
+                                onClear={() => {
+                                    setCodeViewState(prev => ({
+                                        ...prev,
+                                        previewContent: '',
+                                        output: '',
+                                        executionTime: ''
+                                    }));
+                                }}
+                            />
+                        </div>
+                    )}
+
+                    <div
+                        className={`hidden lg:block absolute top-0 bottom-0 w-2 -ml-1 z-30 cursor-col-resize ${activeResizeHandle === 'question' ? 'bg-indigo-400/40' : 'bg-transparent hover:bg-indigo-300/25'}`}
+                        style={{ left: `${questionPaneWidth}%` }}
+                        onMouseDown={(event) => {
+                            event.preventDefault();
+                            startResize('question', event.clientX);
+                        }}
+                    />
+
+                    {shouldShowCodePreview && (
+                        <div
+                            className={`hidden lg:block absolute top-0 bottom-0 w-2 -ml-1 z-30 cursor-col-resize ${activeResizeHandle === 'code' ? 'bg-indigo-400/40' : 'bg-transparent hover:bg-indigo-300/25'}`}
+                            style={{ left: `${100 - codePreviewWidth}%` }}
+                            onMouseDown={(event) => {
+                                event.preventDefault();
+                                startResize('code', event.clientX);
+                            }}
                         />
                     )}
                 </div>
-
-                {/* Third column - Code Preview (only shown for coding questions) */}
-                {isCodeQuestion && codeViewState.isViewingCode && (
-                <div className="border-l h-full overflow-auto border-gray-200 bg-gray-50 dark:border-[#222222] dark:bg-[#111111]">
-                        <CodePreview
-                            isRunning={codeViewState.isRunning}
-                            previewContent={codeViewState.previewContent}
-                            output={codeViewState.output}
-                            isWebPreview={codeViewState.hasWebLanguages}
-                            executionTime={codeViewState.executionTime}
-                            onClear={() => {
-                                // Clear the code output in the codeViewState
-                                setCodeViewState(prev => ({
-                                    ...prev,
-                                    previewContent: '',
-                                    output: '',
-                                    executionTime: ''
-                                }));
-                            }}
-                        />
-                    </div>
-                )}
             </div>
 
             {/* Navigation Confirmation Dialog */}

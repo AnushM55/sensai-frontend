@@ -112,6 +112,7 @@ export default function LearnerAssignmentView({
     const [isViewingScorecard, setIsViewingScorecard] = useState(false);
     const [activeScorecard, setActiveScorecard] = useState<ScorecardItem[]>([]);
     const [activeAttemptId, setActiveAttemptId] = useState<number | undefined>(undefined);
+    const [activeDiffFromPrevious, setActiveDiffFromPrevious] = useState<FeedbackCriterionDiff[]>([]);
     const [feedbackAttempts, setFeedbackAttempts] = useState<FeedbackAttemptSummary[]>([]);
     const [isReevaluating, setIsReevaluating] = useState(false);
     const [showPreparingReport, setShowPreparingReport] = useState(false);
@@ -221,7 +222,7 @@ export default function LearnerAssignmentView({
             pass_score: Number(criterion?.pass_score || 0),
             feedback: {
                 correct: '',
-                wrong: criterion?.next_step || '',
+                wrong: criterion?.improvement_areas || criterion?.next_step || '',
             },
             evidence: Array.isArray(criterion?.evidence) ? criterion.evidence : [],
             next_step: criterion?.next_step || '',
@@ -249,6 +250,10 @@ export default function LearnerAssignmentView({
 
             return {
                 ...item,
+                feedback: {
+                    ...(item.feedback || { correct: '', wrong: '' }),
+                    wrong: criterion.improvement_areas || item.feedback?.wrong || '',
+                },
                 evidence: criterion.evidence,
                 next_step: criterion.next_step,
                 severity: criterion.severity,
@@ -1079,6 +1084,7 @@ export default function LearnerAssignmentView({
         message?: ChatMessage,
         explicitAttemptId?: number,
         feedbackOutput?: FeedbackOutput,
+        explicitDiff?: FeedbackCriterionDiff[],
     ) => {
         setActiveScorecard(
             mergeFeedbackOutputIntoScorecard(
@@ -1091,6 +1097,11 @@ export default function LearnerAssignmentView({
             ?? message?.attemptId
             ?? feedbackOutput?.attempt_id
             ?? message?.feedbackOutput?.attempt_id
+        );
+        setActiveDiffFromPrevious(
+            explicitDiff
+            ?? message?.diffFromPrevious
+            ?? []
         );
         setIsViewingScorecard(true);
         // Hide preparing report once the scorecard is opened
@@ -1177,7 +1188,13 @@ export default function LearnerAssignmentView({
             };
 
             setChatHistory((prev) => [...prev, aiMessage]);
-            handleViewScorecard(scorecard, aiMessage as unknown as ChatMessage, payload.attempt_id, feedbackOutput);
+            handleViewScorecard(
+                scorecard,
+                aiMessage as unknown as ChatMessage,
+                payload.attempt_id,
+                feedbackOutput,
+                payload.diff_from_previous,
+            );
 
             fetchFeedbackAttempts();
 
@@ -1528,6 +1545,7 @@ export default function LearnerAssignmentView({
                             lastUserMessage={null}
                             feedbackAttempts={feedbackAttempts}
                             activeAttemptId={activeAttemptId}
+                            currentDiff={activeDiffFromPrevious}
                             onReevaluate={handleReevaluate}
                             isReevaluating={isReevaluating}
                         />
